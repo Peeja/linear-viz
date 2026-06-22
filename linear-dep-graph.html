@@ -798,6 +798,37 @@ function orthoPath(pts, r) {
   return d;
 }
 
+// Lay a string into (up to) two tspan lines inside `sel`, wrapping on word
+// boundaries to fit `maxW` px. If words remain after the second line, the
+// second line is ellipsized. Measures with getComputedTextLength (the element
+// is already attached to the live SVG, so the measurement is real).
+function wrapTitleTwoLines(sel, str, x, [y1,y2], maxW) {
+  const words=(str||'').trim().split(/\s+/).filter(Boolean);
+  const l1=sel.append('tspan').attr('x',x).attr('y',y1).node();
+  const l2=sel.append('tspan').attr('x',x).attr('y',y2).node();
+  const fits=(node,s)=>{ node.textContent=s; return node.getComputedTextLength()<=maxW; };
+  let i=0, s1='';
+  while(i<words.length){                       // greedily fill line 1
+    const cand=s1?s1+' '+words[i]:words[i];
+    if(!fits(l1,cand) && s1) break;            // always keep ≥1 word per line
+    s1=cand; i++;
+  }
+  l1.textContent=s1;
+  let s2='';
+  while(i<words.length){                        // greedily fill line 2
+    const cand=s2?s2+' '+words[i]:words[i];
+    if(!fits(l2,cand) && s2) break;
+    s2=cand; i++;
+  }
+  if(i<words.length){                           // leftover → ellipsize line 2
+    let t=s2;
+    while(t && !fits(l2,t+'…')) t=t.slice(0,-1);
+    l2.textContent=(t||s2)+'…';
+  } else {
+    l2.textContent=s2;
+  }
+}
+
 // ── Render ───────────────────────────────────────────────────────────────────
 function render(nodes, links, filterText='') {
   const wrap=document.getElementById('gw');
@@ -987,12 +1018,11 @@ function render(nodes, links, filterText='') {
       .attr('fill',col).attr('fill-opacity',ext?0.55:1)
       .text(n.identifier);
 
-    // Title
-    const t=n.title.length>23?n.title.slice(0,22)+'…':n.title;
-    g.append('text').attr('x',11).attr('y',31)
+    // Title — wrapped to two lines (fixed card size).
+    const titleEl=g.append('text')
       .attr('font-size',11).attr('font-family','var(--font)')
-      .attr('fill','var(--text)').attr('fill-opacity',ext?0.4:0.85)
-      .text(t);
+      .attr('fill','var(--text)').attr('fill-opacity',ext?0.4:0.85);
+    wrapTitleTwoLines(titleEl, n.title, 11, [28,39], NW-19);
   });
 
   // Graph is sized to fit width and centred (gSel transform set above); the
