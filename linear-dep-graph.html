@@ -1021,6 +1021,9 @@ document.getElementById('lb').addEventListener('click', async ()=>{
     const nb=links.filter(l=>l.type==='blocks').length;
     setStatus(`${issues.length} issues · ${nb} blocking relation${nb!==1?'s':''} · click to open in Linear`);
     render(allNodes,allLinks,document.getElementById('fi').value);
+    // Reflect the loaded root in the URL so a refresh keeps it (no history spam).
+    const url=new URL(location.href); url.searchParams.set('issue',pid);
+    history.replaceState(null,'',url);
   } catch(e) { setStatus('Error: '+e.message,true); console.error(e); }
   finally { btn.disabled=false; btn.textContent='Reload'; }
 });
@@ -1033,6 +1036,13 @@ window.addEventListener('resize', ()=>{ if(allNodes.length) render(allNodes,allL
 
 // Pick up the workspace slug (for click-to-open links) from the server config.
 fetch('/api/meta').then(r=>r.json()).then(m=>{ if(m.workspace) WORKSPACE=m.workspace; }).catch(()=>{});
+
+// Restore the root issue from the URL (?issue=FIL-273) so a refresh keeps it.
+const initialIssue=new URLSearchParams(location.search).get('issue');
+if(initialIssue){
+  document.getElementById('pi').value=initialIssue;
+  document.getElementById('lb').click();
+}
 </script>
 </body>
 </html>
