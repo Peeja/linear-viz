@@ -53,9 +53,8 @@ button:disabled { opacity:0.4; cursor:default; transform:none; }
 .legend { display:flex; gap:12px; font-size:11px; color:var(--text2); flex-wrap:wrap; margin-left:auto; }
 .li { display:flex; align-items:center; gap:4px; }
 .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
-#gw { flex:1; position:relative; overflow:hidden; background:var(--bg2); min-height:0; }
-#gw svg { display:block; cursor:grab; }
-#gw svg:active { cursor:grabbing; }
+#gw { flex:1; position:relative; overflow-y:auto; overflow-x:auto; background:var(--bg2); min-height:0; }
+#gw svg { display:block; }
 .es {
   position:absolute; inset:0; display:flex; flex-direction:column;
   align-items:center; justify-content:center; gap:8px;
@@ -78,14 +77,13 @@ button:disabled { opacity:0.4; cursor:default; transform:none; }
       <input type="text" id="pi" class="ii" placeholder="Parent ID  e.g. FIL-273" spellcheck="false"/>
       <button id="lb">Load</button>
       <input type="text" id="fi" class="fi" placeholder="Filter by identifier or title…"/>
-      <button id="zf">Fit</button>
-      <button id="zr">1:1</button>
+      <button id="zf">Top</button>
     </div>
     <div class="kh">API key loaded server-side from config.json — never sent to the browser.</div>
   </div>
 </header>
 <div class="sb" id="sb">
-  <span id="st">Enter your Linear API key and a parent issue ID, then click Load.</span>
+  <span id="st">Enter a parent issue ID (e.g. FIL-273) and click Load.</span>
   <div class="legend" id="legend" style="display:none">
     <div class="li"><div class="dot" style="background:var(--c-done)"></div>Done</div>
     <div class="li"><div class="dot" style="background:var(--c-progress)"></div>In progress</div>
@@ -109,7 +107,7 @@ button:disabled { opacity:0.4; cursor:default; transform:none; }
 <script>
 const GQL = '/api/graphql';  // local proxy; key is injected server-side
 const NW = 172, NH = 44, HGAP = 40, VGAP = 88, R = 6;
-let allNodes=[], allLinks=[], zoomBeh, svgSel, gSel;
+let allNodes=[], allLinks=[], svgSel, gSel;
 let WORKSPACE = 'filecoin-foundation';  // overwritten from /api/meta
 
 const isDummy = id => typeof id === 'string' && id.startsWith('__d_');
@@ -119,8 +117,25 @@ function stateColor(t) {
   const s = t.toLowerCase();
   if (s==='completed') return '#1D9E75';
   if (s==='started')   return '#378ADD';
-  if (s==='cancelled') return '#D85A30';
+  if (s==='canceled'||s==='cancelled') return '#D85A30';
   return '#888780';
+}
+
+// Status → region. 0=Done (top), 1=In Progress (middle), 2=Todo (bottom).
+// The timeline reads top→bottom as done → now → not-yet, so completing an issue
+// moves it UP into Done. Canceled also lands in Done (dimmed) so abandoned work
+// drifts up into the past rather than lingering in the Todo backlog.
+const REGIONS=[
+  {key:'done',  label:'Done',        color:'#1D9E75'},
+  {key:'prog',  label:'In Progress', color:'#378ADD'},
+  {key:'todo',  label:'Todo',        color:'#888780'},
+];
+function regionOf(stateType) {
+  const s=(stateType||'').toLowerCase();
+  if (s==='completed') return 0;
+  if (s==='canceled'||s==='cancelled') return 0;  // drift into the past
+  if (s==='started')   return 1;
+  return 2;  // backlog, unstarted, triage → Todo
 }
 function setStatus(m, err=false) {
   document.getElementById('st').textContent = m;
@@ -216,6 +231,35 @@ function compactLayers(nodes, links, rank) {
     });
   }
   return rank;
+}
+
+// 1c. Region-aware ranking. Replaces the single global layering: status hard-
+// assigns each node to a region (Done/InProgress/Todo), we layer WITHIN each
+// region using only intra-region block edges, then stack the regions so global
+// rank = (rows used by earlier regions) + intra-region rank. Cross-region edges
+// don't influence ranking — forward ones (Done→…→Todo) point down naturally
+// because regions are stacked in that order; backward ones (pathological) are
+// just drawn as-is and never perturb the normal intra-region layout.
+function regionRank(nodes, links) {
+  const regionTiers=[0,0,0];
+  const rank=new Map();
+  const nodeRegion=new Map(nodes.map(n=>[n.id, regionOf(n.stateType)]));
+  for (let rg=0; rg<3; rg++) {
+    const members=nodes.filter(n=>nodeRegion.get(n.id)===rg);
+    if (!members.length) continue;
+    const ids=new Set(members.map(n=>n.id));
+    // only edges with BOTH endpoints in this region drive intra-region depth
+    const intra=links.filter(l=>l.type==='blocks'&&ids.has(l.source)&&ids.has(l.target));
+    let local=assignLayers(members, intra);
+    local=compactLayers(members, intra, local);
+    let maxLocal=0; members.forEach(n=>{ maxLocal=Math.max(maxLocal, local.get(n.id)); });
+    regionTiers[rg]=maxLocal+1;
+    members.forEach(n=>rank.set(n.id, local.get(n.id)));   // local rank, offset below
+  }
+  // offset each region by the cumulative tiers of the regions above it
+  const offset=[0, regionTiers[0], regionTiers[0]+regionTiers[1]];
+  nodes.forEach(n=>{ const rg=nodeRegion.get(n.id); rank.set(n.id, offset[rg]+(rank.get(n.id)??0)); });
+  return {rank, regionTiers, offset, nodeRegion};
 }
 
 // 2. Dummy node insertion for edges spanning >1 layer
@@ -369,8 +413,9 @@ function minimizeCrossings(layers, augLinks) {
 //   2. Assign each block one x (the column), then compact layers left-to-right
 //      keeping ≥ (NW+HGAP) between neighbours in a layer and pulling blocks
 //      toward their desired aligned x.
-function assignCoords(layers, augLinks) {
+function assignCoords(layers, augLinks, regionInfo) {
   const SEP=NW+HGAP;
+  const REGION_GAP=0;    // no extra space between bands — backgrounds tile fully
   const idLayer=new Map(), idIdx=new Map();
   layers.forEach((layer,ri)=>layer.forEach((id,ci)=>{ idLayer.set(id,ri); idIdx.set(id,ci); }));
 
@@ -436,21 +481,71 @@ function assignCoords(layers, augLinks) {
     });
   }
 
-  // normalise to ≥0 and build position records
+  // normalise to ≥0 and build position records.
+  // Row→Y adds REGION_GAP each time we cross into a new status band, so the
+  // three regions are visually separated. regionInfo.offset = first row of
+  // [Done, InProgress, Todo]; a region with 0 tiers contributes no gap.
   let minX=Infinity;
   x.forEach(v=>{ if(v<minX) minX=v; });
+  const offset=regionInfo?.offset||[0,0,0];
+  const tiers=regionInfo?.regionTiers||[0,0,0];
+  const LABEL_H=26;   // headroom above the topmost row for the band label
+  // rowRegion(ri): which region row ri sits in
+  const rowRegion=ri=> ri<offset[1]?0 : ri<offset[2]?1 : 2;
+  // how many band-gaps precede region rg (only count non-empty earlier bands)
+  const gapsBefore=rg=>{ let g=0; for(let r=0;r<rg;r++) if(tiers[r]>0) g++; return g; };
+  const rowY=ri=> LABEL_H + ri*(NH+VGAP) + gapsBefore(rowRegion(ri))*REGION_GAP;
+
   let maxRight=0;
   layers.forEach((layer,ri)=>{
+    const py=rowY(ri);
     layer.forEach(id=>{
-      const px=x.get(id)-minX, py=ri*(NH+VGAP);
+      const px=x.get(id)-minX;
       pos.set(id,{x:px,y:py,cx:px+NW/2,cy:py+NH/2,bx:px+NW/2,by:py+NH,tx:px+NW/2,ty:py});
       if(px+NW>maxRight) maxRight=px+NW;
     });
   });
   const PAD=48;
-  const W=maxRight+PAD*2, H=layers.length*(NH+VGAP)-VGAP+PAD*2;
+  const H=rowY(layers.length-1)+NH+PAD*2;
+  const W=maxRight+PAD*2;
   pos.forEach(p=>{ p.x+=PAD; p.cx+=PAD; p.bx+=PAD; p.tx+=PAD; p.y+=PAD; p.cy+=PAD; p.by+=PAD; p.ty+=PAD; });
-  return {pos,W,H};
+
+  // Region bands tile the full background with no gaps. Each boundary sits
+  // midway in the vertical space between one region's last card and the next's
+  // first card; the top band starts at 0 and the bottom band ends at H. Adjacent
+  // bands compute the shared boundary identically, so they meet exactly.
+  const present=[];
+  for(let rg=0; rg<3; rg++) if(tiers[rg]>0) present.push(rg);
+  const cardTop=row=>rowY(row)+PAD, cardBot=row=>rowY(row)+PAD+NH;
+  const boundary=(upperRg,lowerRg)=>
+    (cardBot(offset[upperRg]+tiers[upperRg]-1)+cardTop(offset[lowerRg]))/2;
+  const bands=present.map((rg,i)=>({
+    region:rg,
+    top: i===0 ? 0 : boundary(present[i-1], rg),
+    bot: i===present.length-1 ? H : boundary(rg, present[i+1]),
+  }));
+  return {pos,W,H,bands};
+}
+
+// 5b. Wrap wide tiers so the drawing fits the viewport width. A tier wider than
+// maxCols is split into stacked sub-rows. This is safe: longest-path ranking is
+// proper, so nodes in the same tier never have a block edge between them —
+// stacking them creates no sideways/upward edge. Returns new layers + remapped
+// region offsets. ("Exact tiering is no longer required.")
+function wrapLayers(layers, regionInfo, maxCols) {
+  const {offset, regionTiers}=regionInfo;
+  const origRegion = ri => ri<offset[1]?0 : ri<offset[2]?1 : 2;
+  const newLayers=[], newTiers=[0,0,0];
+  layers.forEach((row,ri)=>{
+    const rg=origRegion(ri);
+    if (row.length<=maxCols || maxCols<1) {
+      newLayers.push(row); newTiers[rg]++;
+    } else {
+      for (let i=0;i<row.length;i+=maxCols){ newLayers.push(row.slice(i,i+maxCols)); newTiers[rg]++; }
+    }
+  });
+  const newOffset=[0, newTiers[0], newTiers[0]+newTiers[1]];
+  return {layers:newLayers, regionInfo:{...regionInfo, regionTiers:newTiers, offset:newOffset}};
 }
 
 // 6. Reconstruct chains through dummies → list of {id, from, to, wps:[positions]}
@@ -630,17 +725,28 @@ function render(nodes, links, filterText='') {
   }
   svgEl.style.display='block'; emptyEl.style.display='none';
 
-  // Pipeline
-  let rank=assignLayers(visNodes, visLinks);
-  rank=compactLayers(visNodes, visLinks, rank);
+  // Pipeline — rank by status region (Done/InProgress/Todo), depth within each
+  const wW=wrap.clientWidth, wH=wrap.clientHeight;
+  const regionInfo=regionRank(visNodes, visLinks);
+  const rank=regionInfo.rank;
   const {augNodes,augLinks}=insertDummies(visNodes, visLinks, rank);
   let layers=buildLayers(augNodes, rank);
   layers=minimizeCrossings(layers, augLinks);
-  const {pos,W,H}=assignCoords(layers, augLinks);
+  // wrap wide tiers to fit the viewport width (cards stay readable; scroll down)
+  const maxCols=Math.max(1, Math.floor((wW-96)/(NW+HGAP)));
+  const wrapped=wrapLayers(layers, regionInfo, maxCols);
+  const {pos,W,H,bands}=assignCoords(wrapped.layers, augLinks, wrapped.regionInfo);
 
-  // SVG
-  const wW=wrap.clientWidth, wH=wrap.clientHeight;
-  svgSel=d3.select(svgEl).attr('width',Math.max(W,wW)).attr('height',Math.max(H,wH));
+  // SVG — fit width, scroll vertically. No interactive zoom. Wrapping keeps the
+  // graph near viewport width; if Brandes–Köpf alignment still overflows, a mild
+  // one-time fit-scale via viewBox absorbs the residue (cards stay readable).
+  const fitScale=W>wW ? wW/W : 1;
+  const svgW=W>wW ? wW : Math.max(W,wW);
+  const svgH=H*fitScale;
+  const offX=W<wW ? (wW-W)/2 : 0;   // centre a narrow graph horizontally
+  svgSel=d3.select(svgEl).attr('width',svgW).attr('height',svgH);
+  if (W>wW) svgSel.attr('viewBox',`0 0 ${W} ${H}`).attr('preserveAspectRatio','xMidYMin meet');
+  else svgSel.attr('viewBox',null);
 
   const defs=svgSel.append('defs');
   [['ab','#E24B4A',8],['ar','#888780',6]].forEach(([id,col,rx])=>{
@@ -651,9 +757,24 @@ function render(nodes, links, filterText='') {
       .attr('stroke',col).attr('stroke-width',1.5).attr('stroke-linecap','round').attr('stroke-linejoin','round');
   });
 
-  gSel=svgSel.append('g');
-  zoomBeh=d3.zoom().scaleExtent([0.06,5]).on('zoom',e=>gSel.attr('transform',e.transform));
-  svgSel.call(zoomBeh);
+  gSel=svgSel.append('g').attr('transform',`translate(${offX},0)`);
+
+  // Status-region bands — full-width tinted rectangles behind everything.
+  // When scaling (W>wW) content 0..W maps to the full width; otherwise gSel is
+  // shifted by offX, so start at -offX and span the viewport width.
+  const bandG=gSel.append('g').attr('class','bands');
+  const bandW=W>wW ? W : Math.max(W,wW);
+  bands.forEach(b=>{
+    const r=REGIONS[b.region];
+    bandG.append('rect')
+      .attr('x',-offX).attr('y',b.top).attr('width',bandW).attr('height',b.bot-b.top)
+      .attr('fill',r.color).attr('fill-opacity',0.06);
+    bandG.append('text')
+      .attr('x',-offX+16).attr('y',b.top+20)
+      .attr('font-size',12).attr('font-weight',600).attr('font-family','var(--font)')
+      .attr('fill',r.color).attr('fill-opacity',0.85).attr('letter-spacing','0.04em')
+      .text(r.label.toUpperCase());
+  });
 
   // Related edges — simple curved arcs, behind everything
   const relEdges=gSel.append('g').attr('class','rel-edges');
@@ -735,8 +856,9 @@ function render(nodes, links, filterText='') {
       })
       .on('mousemove', e=>{
         const rect=wrap.getBoundingClientRect();
-        let x=e.clientX-rect.left+12, y=e.clientY-rect.top-8;
-        if(x+252>wrap.clientWidth) x-=264;
+        // #gw scrolls, so add scroll offsets to map viewport → content coords
+        let x=e.clientX-rect.left+wrap.scrollLeft+12, y=e.clientY-rect.top+wrap.scrollTop-8;
+        if(e.clientX-rect.left+252>wrap.clientWidth) x-=264;
         tooltip.style.left=x+'px'; tooltip.style.top=y+'px';
       })
       .on('mouseout',()=>{ tooltip.style.display='none'; clearHighlight(); })
@@ -765,20 +887,15 @@ function render(nodes, links, filterText='') {
       .text(t);
   });
 
-  // Initial fit
-  const sc=Math.min(1,Math.min((wW-64)/W,(wH-64)/H));
-  const tx=(wW-W*sc)/2, ty=(wH-H*sc)/2;
-  svgSel.call(zoomBeh.transform, d3.zoomIdentity.translate(tx,ty).scale(sc));
+  // Graph is sized to fit width and centred (gSel transform set above); the
+  // page scrolls vertically. Reset scroll to the top on each render.
+  wrap.scrollTop=0;
 }
 
-function triggerFit() {
-  if (!svgSel||!gSel||!zoomBeh) return;
+// Scroll the view to the top (where Done / earliest work sits).
+function scrollToTop() {
   const wrap=document.getElementById('gw');
-  const bb=gSel.node().getBBox();
-  const wW=wrap.clientWidth, wH=wrap.clientHeight, PAD=32;
-  const sc=Math.min(1,Math.min((wW-PAD*2)/bb.width,(wH-PAD*2)/bb.height));
-  const tx=(wW-bb.width*sc)/2-bb.x*sc, ty=(wH-bb.height*sc)/2-bb.y*sc;
-  svgSel.transition().duration(400).call(zoomBeh.transform, d3.zoomIdentity.translate(tx,ty).scale(sc));
+  wrap.scrollTo({top:0, behavior:'smooth'});
 }
 
 // ── Controls ─────────────────────────────────────────────────────────────────
@@ -800,10 +917,7 @@ document.getElementById('lb').addEventListener('click', async ()=>{
   finally { btn.disabled=false; btn.textContent='Reload'; }
 });
 document.getElementById('fi').addEventListener('input', e=>{ if(allNodes.length) render(allNodes,allLinks,e.target.value); });
-document.getElementById('zf').addEventListener('click', triggerFit);
-document.getElementById('zr').addEventListener('click', ()=>{
-  if(svgSel&&zoomBeh) svgSel.transition().duration(350).call(zoomBeh.transform,d3.zoomIdentity);
-});
+document.getElementById('zf').addEventListener('click', scrollToTop);
 document.getElementById('pi').addEventListener('keydown',e=>{
   if(e.key==='Enter') document.getElementById('lb').click();
 });
