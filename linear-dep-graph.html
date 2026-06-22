@@ -191,6 +191,33 @@ function assignLayers(nodes, links) {
   return rank;
 }
 
+// 1b. Pull-down compaction. Longest-path puts every node as early as possible,
+// stranding nodes far above their only successor with long dangling edges.
+// Pull each non-sink node down to just above its earliest successor, as long
+// as that doesn't violate a predecessor (rank must stay > all preds). Iterate
+// to a fixed point. Not NP-hard — a few linear passes; shortens edges and
+// compacts the drawing.
+function compactLayers(nodes, links, rank) {
+  const bl=links.filter(l=>l.type==='blocks');
+  const succ=new Map(nodes.map(n=>[n.id,[]]));
+  const pred=new Map(nodes.map(n=>[n.id,[]]));
+  bl.forEach(l=>{ if(succ.has(l.source)) succ.get(l.source).push(l.target);
+                  if(pred.has(l.target)) pred.get(l.target).push(l.source); });
+  let changed=true, guard=0;
+  while(changed && guard++<nodes.length+4){
+    changed=false;
+    nodes.forEach(n=>{
+      const ss=succ.get(n.id)||[], ps=pred.get(n.id)||[];
+      if(!ss.length) return;                       // sinks stay put
+      const minSucc=Math.min(...ss.map(s=>rank.get(s)));
+      const maxPred=ps.length?Math.max(...ps.map(p=>rank.get(p))):-Infinity;
+      const target=minSucc-1;                       // sit one above earliest successor
+      if(target>rank.get(n.id) && target>maxPred){ rank.set(n.id,target); changed=true; }
+    });
+  }
+  return rank;
+}
+
 // 2. Dummy node insertion for edges spanning >1 layer
 function insertDummies(nodes, links, rank) {
   const augNodes=[...nodes], augLinks=[];
@@ -223,7 +250,13 @@ function buildLayers(augNodes, rank) {
   return layers;
 }
 
-// 4. Crossing minimisation — barycenter heuristic, 24 alternating sweeps
+// 4. Crossing minimisation.
+// Ordering one layer against a fixed neighbour is NP-hard in general, but at
+// our sizes we can do much better than plain barycenter:
+//   • median heuristic (Gansner et al.) — within 3× optimal, beats mean in practice
+//   • count crossings each sweep and KEEP THE BEST ordering seen (not the last)
+//   • brute-force the optimal ordering for small layers (≤ SMALL_LAYER)
+const SMALL_LAYER=6;   // 6! = 720 perms per layer/sweep; above this use median
 function minimizeCrossings(layers, augLinks) {
   const bl=augLinks.filter(l=>l.type==='blocks');
   const succs=new Map(), preds=new Map();
@@ -232,45 +265,190 @@ function minimizeCrossings(layers, augLinks) {
     if(succs.has(l.source)) succs.get(l.source).push(l.target);
     if(preds.has(l.target)) preds.get(l.target).push(l.source);
   });
-  function posMap(layer){ const m=new Map(); layer.forEach((id,i)=>m.set(id,i)); return m; }
-  function bary(layer, neighborFn, pm) {
-    const scores=layer.map(id=>{
-      const ns=neighborFn(id).filter(n=>pm.has(n));
-      return {id, score: ns.length ? ns.reduce((s,n)=>s+pm.get(n),0)/ns.length : Infinity};
+  const posMap=layer=>{ const m=new Map(); layer.forEach((id,i)=>m.set(id,i)); return m; };
+
+  // crossings between adjacent layers upper/lower, given lower's position map.
+  // Standard accumulation: for each edge sort by (upperPos, lowerPos), count
+  // inversions in the lowerPos sequence.
+  function crossingsBetween(upper, lower, pm){
+    const upPos=posMap(upper);
+    const seq=[];
+    upper.forEach(u=>{
+      (succs.get(u)||[]).forEach(v=>{ if(pm.has(v)) seq.push([upPos.get(u), pm.get(v)]); });
     });
-    // stable sort: Infinity items keep relative position
-    let infPos=0;
-    const infItems=scores.filter(s=>s.score===Infinity);
-    return scores.sort((a,b)=>a.score===Infinity&&b.score===Infinity?0:a.score-b.score).map(s=>s.id);
+    seq.sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+    // count inversions in the second coordinate
+    const ys=seq.map(s=>s[1]);
+    let cross=0;
+    for(let i=0;i<ys.length;i++) for(let j=i+1;j<ys.length;j++) if(ys[i]>ys[j]) cross++;
+    return cross;
   }
-  for (let sw=0; sw<24; sw++) {
+  function totalCrossings(ls){
+    let t=0;
+    for(let i=0;i<ls.length-1;i++) t+=crossingsBetween(ls[i], ls[i+1], posMap(ls[i+1]));
+    return t;
+  }
+
+  // median position of a node's fixed-layer neighbours (dot algorithm)
+  function median(vals){
+    if(!vals.length) return -1;
+    vals.sort((a,b)=>a-b);
+    const m=Math.floor(vals.length/2);
+    if(vals.length%2===1) return vals[m];
+    if(vals.length===2) return (vals[0]+vals[1])/2;
+    const l=vals[m-1]-vals[0], r=vals[vals.length-1]-vals[m];
+    return (l+r)===0 ? (vals[m-1]+vals[m])/2 : (vals[m-1]*r+vals[m]*l)/(l+r);
+  }
+  // reorder `layer` by median of neighbours; nodes with no fixed neighbour keep position
+  function medianOrder(layer, neighborFn, pm){
+    const withPos=layer.map((id,i)=>{
+      const ns=neighborFn(id).map(n=>pm.get(n)).filter(p=>p!==undefined);
+      return {id, i, m: median(ns)};
+    });
+    const fixed=withPos.filter(o=>o.m<0);          // keep where they are
+    const movable=withPos.filter(o=>o.m>=0).sort((a,b)=>a.m-b.m || a.i-b.i);
+    // merge: place movable in sorted order, leaving fixed at their original index
+    const out=new Array(layer.length);
+    fixed.forEach(o=>out[o.i]=o.id);
+    let mi=0;
+    for(let i=0;i<out.length;i++){ if(out[i]===undefined){ out[i]=movable[mi++].id; } }
+    return out;
+  }
+  // optimal ordering of a small layer against a fixed neighbour, by brute force
+  function permute(arr){
+    if(arr.length<=1) return [arr];
+    const res=[];
+    arr.forEach((v,i)=>{ const rest=arr.slice(0,i).concat(arr.slice(i+1));
+      permute(rest).forEach(p=>res.push([v,...p])); });
+    return res;
+  }
+  function optimalOrder(layer, fixedLayer, isUpperFixed){
+    // crossings of (fixedLayer, layer) or (layer, fixedLayer) for a candidate
+    const best={order:layer, c:Infinity};
+    const fixedPm=posMap(fixedLayer);
+    permute(layer).forEach(cand=>{
+      const c = isUpperFixed
+        ? crossingsBetween(fixedLayer, cand, posMap(cand))
+        : crossingsBetween(cand, fixedLayer, fixedPm);
+      if(c<best.c){ best.c=c; best.order=cand; }
+    });
+    return best.order;
+  }
+
+  let best=layers.map(l=>[...l]);
+  let bestC=totalCrossings(best);
+  let stale=0;                          // sweeps since last improvement
+  for (let sw=0; sw<24 && bestC>0 && stale<4; sw++) {
     if (sw%2===0) {
       for (let i=1;i<layers.length;i++) {
-        layers[i]=bary(layers[i], id=>preds.get(id)||[], posMap(layers[i-1]));
+        layers[i] = layers[i].length<=SMALL_LAYER
+          ? optimalOrder(layers[i], layers[i-1], true)
+          : medianOrder(layers[i], id=>preds.get(id)||[], posMap(layers[i-1]));
       }
     } else {
       for (let i=layers.length-2;i>=0;i--) {
-        layers[i]=bary(layers[i], id=>succs.get(id)||[], posMap(layers[i+1]));
+        layers[i] = layers[i].length<=SMALL_LAYER
+          ? optimalOrder(layers[i], layers[i+1], false)
+          : medianOrder(layers[i], id=>succs.get(id)||[], posMap(layers[i+1]));
       }
     }
+    const c=totalCrossings(layers);
+    if(c<bestC){ bestC=c; best=layers.map(l=>[...l]); stale=0; } else { stale++; }
   }
-  return layers;
+  return best;
 }
 
-// 5. Assign coordinates, centre each layer
-function assignCoords(layers) {
+// 5. X-coordinate assignment — Brandes–Köpf style alignment.
+// Naively centering each layer makes straight chains zig-zag. Instead we align
+// each node with a median neighbour so long dependency chains draw as straight
+// vertical lines and edge length shrinks. Linear-time, not NP-hard.
+//
+// Approach (a pragmatic single-direction BK):
+//   1. Build vertical "alignment blocks": each node tries to align with the
+//      median of its upper neighbours; conflicting alignments are dropped.
+//   2. Assign each block one x (the column), then compact layers left-to-right
+//      keeping ≥ (NW+HGAP) between neighbours in a layer and pulling blocks
+//      toward their desired aligned x.
+function assignCoords(layers, augLinks) {
+  const SEP=NW+HGAP;
+  const idLayer=new Map(), idIdx=new Map();
+  layers.forEach((layer,ri)=>layer.forEach((id,ci)=>{ idLayer.set(id,ri); idIdx.set(id,ci); }));
+
+  // upper neighbours (preds) for alignment
+  const bl=(augLinks||[]).filter(l=>l.type==='blocks');
+  const preds=new Map(); layers.forEach(l=>l.forEach(id=>preds.set(id,[])));
+  bl.forEach(l=>{ if(preds.has(l.target)) preds.get(l.target).push(l.source); });
+
+  // 1. Alignment: walk layers top→down, align each node to its median upper
+  // neighbour if that neighbour isn't already claimed by a node to our left
+  // (prevents crossing alignments).
+  const align=new Map();   // node -> node it's aligned with in the layer above (root chain)
+  const root=new Map();    // node -> root of its vertical block
+  layers.forEach(l=>l.forEach(id=>{ align.set(id,id); root.set(id,id); }));
+  function findRoot(id){ let r=id; while(root.get(r)!==r) r=root.get(r); return r; }
+
+  for(let ri=1; ri<layers.length; ri++){
+    let lastUpperIdx=-1;   // enforce no-cross: chosen upper idx must increase
+    layers[ri].forEach(id=>{
+      const ups=(preds.get(id)||[]).filter(u=>idLayer.get(u)===ri-1)
+        .map(u=>({u, idx:idIdx.get(u)})).sort((a,b)=>a.idx-b.idx);
+      if(!ups.length) return;
+      const m=ups.length, mid=(m-1)/2;
+      // median candidate(s)
+      const cands=[ups[Math.floor(mid)], ups[Math.ceil(mid)]];
+      for(const c of cands){
+        if(c.idx>lastUpperIdx){
+          align.set(id, c.u);
+          root.set(id, findRoot(c.u));     // join the upper node's block
+          lastUpperIdx=c.idx;
+          break;
+        }
+      }
+    });
+  }
+
+  // 2. Desired x per node = its index slot; we want aligned nodes to share x.
+  // Compute a target x for each block as the max of member slot-x, then place
+  // each layer left to right respecting SEP and nudging toward block target.
   const pos=new Map();
-  const maxLayerW=Math.max(...layers.map(l=>l.length*(NW+HGAP)-HGAP));
+  // initial x by slot
+  const x=new Map();
+  layers.forEach(layer=>layer.forEach((id,ci)=>x.set(id, ci*SEP)));
+
+  // For each block (group by root), set every member to the average of members'
+  // current x, then resolve overlaps within each layer by left-packing.
+  const blocks=new Map();
+  layers.forEach(layer=>layer.forEach(id=>{
+    const r=findRoot(id); if(!blocks.has(r)) blocks.set(r,[]); blocks.get(r).push(id);
+  }));
+  // a few relaxation rounds: align block, then de-overlap layers
+  for(let pass=0; pass<6; pass++){
+    blocks.forEach(members=>{
+      const ax=members.reduce((s,id)=>s+x.get(id),0)/members.length;
+      members.forEach(id=>x.set(id,ax));
+    });
+    // de-overlap each layer left→right
+    layers.forEach(layer=>{
+      for(let i=1;i<layer.length;i++){
+        const minX=x.get(layer[i-1])+SEP;
+        if(x.get(layer[i])<minX) x.set(layer[i],minX);
+      }
+    });
+  }
+
+  // normalise to ≥0 and build position records
+  let minX=Infinity;
+  x.forEach(v=>{ if(v<minX) minX=v; });
+  let maxRight=0;
   layers.forEach((layer,ri)=>{
-    const layerW=layer.length*(NW+HGAP)-HGAP;
-    const offsetX=(maxLayerW-layerW)/2;
-    layer.forEach((id,ci)=>{
-      const x=offsetX+ci*(NW+HGAP), y=ri*(NH+VGAP);
-      pos.set(id,{x,y,cx:x+NW/2,cy:y+NH/2,bx:x+NW/2,by:y+NH,tx:x+NW/2,ty:y});
+    layer.forEach(id=>{
+      const px=x.get(id)-minX, py=ri*(NH+VGAP);
+      pos.set(id,{x:px,y:py,cx:px+NW/2,cy:py+NH/2,bx:px+NW/2,by:py+NH,tx:px+NW/2,ty:py});
+      if(px+NW>maxRight) maxRight=px+NW;
     });
   });
   const PAD=48;
-  const W=maxLayerW+PAD*2, H=layers.length*(NH+VGAP)-VGAP+PAD*2;
+  const W=maxRight+PAD*2, H=layers.length*(NH+VGAP)-VGAP+PAD*2;
   pos.forEach(p=>{ p.x+=PAD; p.cx+=PAD; p.bx+=PAD; p.tx+=PAD; p.y+=PAD; p.cy+=PAD; p.by+=PAD; p.ty+=PAD; });
   return {pos,W,H};
 }
@@ -453,11 +631,12 @@ function render(nodes, links, filterText='') {
   svgEl.style.display='block'; emptyEl.style.display='none';
 
   // Pipeline
-  const rank=assignLayers(visNodes, visLinks);
+  let rank=assignLayers(visNodes, visLinks);
+  rank=compactLayers(visNodes, visLinks, rank);
   const {augNodes,augLinks}=insertDummies(visNodes, visLinks, rank);
   let layers=buildLayers(augNodes, rank);
   layers=minimizeCrossings(layers, augLinks);
-  const {pos,W,H}=assignCoords(layers);
+  const {pos,W,H}=assignCoords(layers, augLinks);
 
   // SVG
   const wW=wrap.clientWidth, wH=wrap.clientHeight;
