@@ -74,8 +74,11 @@ function send(res, status, type, body) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // Match on the pathname only — the page puts the root issue in the query
+  // string (/?issue=FIL-273), which must not defeat the route match.
+  const pathname = (req.url || '/').split('?')[0];
   // Only same-origin browser calls; no CORS headers (key stays local).
-  if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
+  if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
     fs.readFile(HTML_PATH, (err, buf) => {
       if (err) return send(res, 500, 'text/plain', 'Could not read HTML file.');
       send(res, 200, 'text/html; charset=utf-8', buf);
@@ -83,12 +86,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === 'GET' && req.url === '/api/meta') {
+  if (req.method === 'GET' && pathname === '/api/meta') {
     send(res, 200, 'application/json', JSON.stringify({ workspace: cfg.workspace || 'filecoin-foundation' }));
     return;
   }
 
-  if (req.method === 'POST' && req.url === '/api/graphql') {
+  if (req.method === 'POST' && pathname === '/api/graphql') {
     let body = '';
     req.on('data', (c) => {
       body += c;
