@@ -275,58 +275,129 @@ function assignCoords(layers) {
   return {pos,W,H};
 }
 
-// 6. Reconstruct chains through dummies → list of {from, to, waypoints:[positions]}
+// 6. Reconstruct chains through dummies → list of {id, from, to, wps:[positions]}
+// A real source may block several targets (fan-out), so the dummy spine for
+// each original edge is keyed by the dummy node (which has one successor),
+// while real sources branch. We start one walk per block-link out of a real
+// source and follow single-successor dummies to the real target.
 function buildChains(augLinks, pos) {
-  // Build next-map: source → target for block links
-  const nextMap=new Map();
-  augLinks.filter(l=>l.type==='blocks').forEach(l=>nextMap.set(l.source,l.target));
+  const blockLinks=augLinks.filter(l=>l.type==='blocks');
+  // dummy → its single successor (dummy spine)
+  const dummyNext=new Map();
+  blockLinks.forEach(l=>{ if(isDummy(l.source)) dummyNext.set(l.source,l.target); });
 
-  // Find all real-source, real-target pairs
-  const chains=[];
-  const usedSrc=new Set();
-  augLinks.filter(l=>l.type==='blocks').forEach(l=>{
-    if (isDummy(l.source)) return; // start from real nodes only
-    const chainKey=`${l.source}`;
-    if (usedSrc.has(chainKey+l.target)) return;
-    // walk the chain
-    let cur=l.source;
-    const visited=[cur];
-    while (nextMap.has(cur)) {
-      cur=nextMap.get(cur);
-      if (visited.includes(cur)) break; // cycle guard
+  const chains=[], emitted=new Set();
+  blockLinks.forEach(l=>{
+    if (isDummy(l.source)) return;           // spine segments handled via walk
+    const visited=[l.source];
+    let cur=l.target;
+    visited.push(cur);
+    while (isDummy(cur) && dummyNext.has(cur)) {
+      cur=dummyNext.get(cur);
+      if (visited.includes(cur)) break;      // cycle guard
       visited.push(cur);
-      if (!isDummy(cur)) {
-        // real target found — emit chain from l.source to cur
-        const key=`${l.source}->${cur}`;
-        if (!usedSrc.has(key)) {
-          usedSrc.add(key);
-          const wps=visited.map(id=>pos.get(id)).filter(Boolean);
-          if (wps.length>=2) chains.push({from:l.source,to:cur,wps});
-        }
-        break;
-      }
     }
+    if (isDummy(cur)) return;                 // spine didn't reach a real node
+    const key=`${l.source}->${cur}`;
+    if (emitted.has(key)) return; emitted.add(key);
+    const wps=visited.map(id=>pos.get(id)).filter(Boolean);
+    if (wps.length>=2) chains.push({id:key,from:l.source,to:cur,wps});
   });
   return chains;
 }
 
-// 7. Build orthogonal path points for one chain
-// Strategy: exit bottom-centre of source, travel to mid-gap Y, 
-// go horizontal to target x, enter top-centre of target.
-// For multi-layer chains: route through each inter-layer midpoint.
-function chainToPoints(wps) {
-  const pts=[];
-  for (let i=0;i<wps.length-1;i++) {
-    const p=wps[i], q=wps[i+1];
-    const srcBottom={x:p.bx, y:p.by};
-    const tgtTop={x:q.tx, y:q.ty};
-    const midY=(p.by+q.ty)/2;
-    if (i===0) pts.push(srcBottom);
-    pts.push({x:p.bx, y:midY});
-    pts.push({x:q.tx, y:midY});
-    if (i===wps.length-2) pts.push(tgtTop);
-  }
-  return pts;
+// 7. Global router — assign distinct exit/entry ports per node and distinct
+// horizontal lanes per inter-layer gap, so parallel runs don't overlap.
+//
+// Each chain is {from, to, wps:[positions]}. We mutate each chain to carry
+// `pts` (the orthogonal point list) and `gap` info for highlighting.
+function routeChains(chains, pos) {
+  // ── Ports: spread edge endpoints across each node's bottom/top edge ──
+  // Group chains by real source (for exit ports) and real target (entry ports).
+  const PORT_INSET = 14;          // keep ports off the rounded corners
+  const usable = NW - PORT_INSET*2;
+
+  const bySource = new Map();     // sourceId -> [chains]
+  const byTarget = new Map();
+  chains.forEach(c => {
+    if (!bySource.has(c.from)) bySource.set(c.from, []);
+    if (!byTarget.has(c.to)) byTarget.set(c.to, []);
+    bySource.get(c.from).push(c);
+    byTarget.get(c.to).push(c);
+  });
+
+  // Exit ports: order by the x of the chain's next waypoint (where it heads).
+  bySource.forEach(cs => {
+    cs.sort((a,b)=>(a.wps[1]?.cx ?? a.wps[1]?.x ?? 0)-(b.wps[1]?.cx ?? b.wps[1]?.x ?? 0));
+    const p = pos.get(cs[0].from);
+    cs.forEach((c,j)=>{
+      const t = cs.length===1 ? 0.5 : (j+1)/(cs.length+1);
+      c.exitX = p.x + PORT_INSET + usable*t;
+    });
+  });
+  // Entry ports: order by the x of the chain's penultimate waypoint.
+  byTarget.forEach(ct => {
+    ct.sort((a,b)=>{
+      const aw=a.wps[a.wps.length-2], bw=b.wps[b.wps.length-2];
+      return (aw?.cx ?? aw?.x ?? 0)-(bw?.cx ?? bw?.x ?? 0);
+    });
+    const p = pos.get(ct[0].to);
+    ct.forEach((c,j)=>{
+      const t = ct.length===1 ? 0.5 : (j+1)/(ct.length+1);
+      c.entryX = p.x + PORT_INSET + usable*t;
+    });
+  });
+
+  // ── Lanes: each chain crosses one or more inter-layer gaps. For each gap,
+  // give every horizontal segment crossing it a distinct Y so they don't merge.
+  // A gap is keyed by the source waypoint's bottom-Y (rows are uniform).
+  const gapMembers = new Map();   // gapKey -> [{chain, segIndex}]
+  chains.forEach(c => {
+    for (let i=0;i<c.wps.length-1;i++) {
+      const key = c.wps[i].by.toFixed(1);
+      if (!gapMembers.has(key)) gapMembers.set(key, []);
+      gapMembers.get(key).push({chain:c, segIndex:i});
+    }
+  });
+
+  const laneY = new Map();        // chain+seg -> y of its horizontal run
+  gapMembers.forEach((members, key) => {
+    // The gap spans from by (top of gap) to next row's ty.
+    const sample = members[0];
+    const top = sample.chain.wps[sample.segIndex].by;
+    const bot = sample.chain.wps[sample.segIndex+1].ty;
+    const span = bot - top;
+    // Order lanes left-to-right by where the horizontal run starts, so lanes
+    // nest sensibly and crossings are reduced.
+    members.sort((a,b)=>{
+      const ax = a.segIndex===0 ? a.chain.exitX : a.chain.wps[a.segIndex].cx;
+      const bx = b.segIndex===0 ? b.chain.exitX : b.chain.wps[b.segIndex].cx;
+      return ax-bx;
+    });
+    const n = members.length;
+    members.forEach((m,idx)=>{
+      // distribute lanes across the central ~70% of the gap
+      const t = n===1 ? 0.5 : 0.15 + 0.7*(idx/(n-1));
+      laneY.set(m.chain.id+':'+m.segIndex, top + span*t);
+    });
+  });
+
+  // ── Build the point list for each chain using ports + lanes ──
+  chains.forEach(c => {
+    const wps=c.wps, pts=[];
+    for (let i=0;i<wps.length-1;i++) {
+      const p=wps[i], q=wps[i+1];
+      const startX = i===0 ? c.exitX : p.cx;
+      const endX   = i===wps.length-2 ? c.entryX : q.cx;
+      const runY = laneY.get(c.id+':'+i) ?? (p.by+q.ty)/2;
+      if (i===0) pts.push({x:startX, y:p.by});       // exit bottom of source
+      pts.push({x:startX, y:runY});                  // down to this gap's lane
+      pts.push({x:endX, y:runY});                    // horizontal across lane
+      if (i===wps.length-2) pts.push({x:endX, y:q.ty}); // enter top of target
+    }
+    c.pts = pts;
+  });
+  return chains;
 }
 
 // Deduplicate consecutive identical points
@@ -415,29 +486,63 @@ function render(nodes, links, filterText='') {
     const mx=Math.max(x1,x2)+bulge;
     relEdges.append('path')
       .attr('d',`M ${x1} ${y1} C ${mx} ${y1} ${mx} ${y2} ${x2} ${y2}`)
+      .attr('data-src',l.source).attr('data-tgt',l.target).attr('data-related','1')
       .attr('fill','none').attr('stroke','#888780').attr('stroke-width',0.8)
       .attr('stroke-dasharray','3 2').attr('stroke-opacity',0.4)
       .attr('marker-end','url(#ar)');
   });
 
-  // Blocks edges — orthogonal
+  // Blocks edges — orthogonal, with distributed ports + lanes
   const blockEdges=gSel.append('g').attr('class','block-edges');
-  const chains=buildChains(augLinks, pos);
-  chains.forEach(({wps})=>{
-    const pts=chainToPoints(wps);
+  const chains=routeChains(buildChains(augLinks, pos), pos);
+  chains.forEach(c=>{
     blockEdges.append('path')
-      .attr('d',orthoPath(pts,R))
+      .attr('d',orthoPath(c.pts,R))
+      .attr('data-src',c.from).attr('data-tgt',c.to)
       .attr('fill','none').attr('stroke','#E24B4A').attr('stroke-width',1.2)
       .attr('stroke-opacity',0.72).attr('marker-end','url(#ab)');
   });
+
+  // Adjacency over block links (for transitive upstream/downstream highlight)
+  const fwd=new Map(), rev=new Map();   // fwd: blocks → ; rev: blocked-by ←
+  visNodes.forEach(n=>{ fwd.set(n.id,[]); rev.set(n.id,[]); });
+  visLinks.filter(l=>l.type==='blocks').forEach(l=>{
+    if(fwd.has(l.source)) fwd.get(l.source).push(l.target);
+    if(rev.has(l.target)) rev.get(l.target).push(l.source);
+  });
+  function reach(start, adj) {           // transitive closure incl. start
+    const seen=new Set([start]), stack=[start];
+    while(stack.length){ const cur=stack.pop();
+      (adj.get(cur)||[]).forEach(nx=>{ if(!seen.has(nx)){seen.add(nx); stack.push(nx);} });
+    }
+    return seen;
+  }
+  function highlight(nodeId){
+    // chain = node + everything upstream + everything downstream
+    const set=new Set([...reach(nodeId,fwd),...reach(nodeId,rev)]);
+    nodeG.selectAll('g[data-node]').attr('opacity',function(){
+      return set.has(this.getAttribute('data-node'))?1:0.12;
+    });
+    blockEdges.selectAll('path').attr('stroke-opacity',function(){
+      const s=this.getAttribute('data-src'), t=this.getAttribute('data-tgt');
+      return set.has(s)&&set.has(t)?0.95:0.06;
+    });
+    relEdges.selectAll('path').attr('stroke-opacity',0.06);
+  }
+  function clearHighlight(){
+    nodeG.selectAll('g[data-node]').attr('opacity',1);
+    blockEdges.selectAll('path').attr('stroke-opacity',0.72);
+    relEdges.selectAll('path').attr('stroke-opacity',0.4);
+  }
 
   // Nodes
   const nodeG=gSel.append('g').attr('class','nodes');
   visNodes.forEach(n=>{
     const p=pos.get(n.id); if(!p) return;
     const col=stateColor(n.stateType), ext=n.external;
-    const g=nodeG.append('g').attr('transform',`translate(${p.x},${p.y})`).style('cursor','pointer')
+    const g=nodeG.append('g').attr('data-node',n.id).attr('transform',`translate(${p.x},${p.y})`).style('cursor','pointer')
       .on('mouseover', ()=>{
+        highlight(n.id);
         const bMe=visLinks.filter(l=>l.target===n.id&&l.type==='blocks')
           .map(l=>visNodes.find(x=>x.id===l.source)?.identifier||l.source);
         const iBlk=visLinks.filter(l=>l.source===n.id&&l.type==='blocks')
@@ -455,7 +560,7 @@ function render(nodes, links, filterText='') {
         if(x+252>wrap.clientWidth) x-=264;
         tooltip.style.left=x+'px'; tooltip.style.top=y+'px';
       })
-      .on('mouseout',()=>tooltip.style.display='none')
+      .on('mouseout',()=>{ tooltip.style.display='none'; clearHighlight(); })
       .on('click',()=>window.open(`https://linear.app/${WORKSPACE}/issue/${n.identifier}`,'_blank'));
 
     // Card background
