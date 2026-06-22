@@ -153,8 +153,9 @@ async function gqlQ(query, vars={}) {
   if (j.errors?.length) throw new Error(j.errors[0].message);
   return j.data;
 }
-const FRAG = `id identifier title state{type name}
-  relations(first:50){nodes{type relatedIssue{id identifier title state{type name}}}}`;
+const USER = `assignee{name displayName avatarUrl}`;
+const FRAG = `id identifier title state{type name} ${USER}
+  relations(first:50){nodes{type relatedIssue{id identifier title state{type name} ${USER}}}}`;
 async function loadIssues(pid) {
   // issue(id:) accepts both the human identifier (e.g. "FIL-273") and the UUID
   const pd = await gqlQ(`query($id:String!){issue(id:$id){${FRAG} children(first:250){nodes{${FRAG}}}}}`,{id:pid});
@@ -169,7 +170,7 @@ async function loadIssues(pid) {
 function buildGraph(issues) {
   const nm = new Map();
   issues.forEach(i => nm.set(i.id, {id:i.id,identifier:i.identifier,title:i.title,
-    stateType:i.state?.type, stateName:i.state?.name, external:false}));
+    stateType:i.state?.type, stateName:i.state?.name, assignee:i.assignee||null, external:false}));
   const links=[], seen=new Set();
   issues.forEach(iss => {
     (iss.relations?.nodes||[]).forEach(rel => {
@@ -177,7 +178,7 @@ function buildGraph(issues) {
       // Skip blocked_by — it's the mirror of blocks from the other side
       if (rel.type==='blocked_by') return;
       if (!nm.has(ri.id)) nm.set(ri.id,{id:ri.id,identifier:ri.identifier,title:ri.title,
-        stateType:ri.state?.type, stateName:ri.state?.name, external:true});
+        stateType:ri.state?.type, stateName:ri.state?.name, assignee:ri.assignee||null, external:true});
       const key=`${iss.id}|${ri.id}|${rel.type}`;
       if (seen.has(key)) return; seen.add(key);
       links.push({source:iss.id, target:ri.id, type:rel.type});
@@ -829,6 +830,20 @@ function wrapTitleTwoLines(sel, str, x, [y1,y2], maxW) {
   }
 }
 
+// Assignee helpers: a display name, initials for the on-card disc, and a
+// stable per-person colour so the same person reads the same everywhere.
+function assigneeName(n){ return n.assignee && (n.assignee.displayName||n.assignee.name) || ''; }
+function initials(name){
+  const parts=(name||'').trim().split(/\s+/).filter(Boolean);
+  if(!parts.length) return '?';
+  if(parts.length===1) return parts[0].slice(0,2).toUpperCase();
+  return (parts[0][0]+parts[parts.length-1][0]).toUpperCase();
+}
+function personColor(name){
+  let h=0; for(let i=0;i<(name||'').length;i++) h=(h*31+name.charCodeAt(i))>>>0;
+  return `hsl(${h%360}, 52%, 52%)`;
+}
+
 // ── Render ───────────────────────────────────────────────────────────────────
 function render(nodes, links, filterText='') {
   const wrap=document.getElementById('gw');
@@ -988,6 +1003,8 @@ function render(nodes, links, filterText='') {
           .map(l=>visNodes.find(x=>x.id===l.target)?.identifier||l.target);
         let h=`<strong>${n.identifier}</strong><br>${n.title}`;
         if (n.stateName) h+=`<br><span style="opacity:0.6">${n.stateName}</span>`;
+        const who=assigneeName(n);
+        if (who) h+=`<br><span style="opacity:0.6">${who}</span>`;
         if (bMe.length) h+=`<br><span style="color:var(--c-block)">Blocked by: ${bMe.join(', ')}</span>`;
         if (iBlk.length) h+=`<br><span style="color:var(--c-block)">Blocks: ${iBlk.join(', ')}</span>`;
         if (ext) h+=`<br><span style="opacity:0.45"><em>External</em></span>`;
@@ -1018,7 +1035,22 @@ function render(nodes, links, filterText='') {
       .attr('fill',col).attr('fill-opacity',ext?0.55:1)
       .text(n.identifier);
 
-    // Title — wrapped to two lines (fixed card size).
+    // Assignee — initials disc in the top-right corner (sits in the identifier
+    // row, above the title lines). Title width is reserved so it never collides.
+    const who=assigneeName(n);
+    if (who) {
+      const cx=NW-13, cy=11, r=7.5;
+      g.append('circle').attr('cx',cx).attr('cy',cy).attr('r',r)
+        .attr('fill',personColor(who)).attr('fill-opacity',ext?0.4:0.95)
+        .attr('stroke',col).attr('stroke-opacity',ext?0.2:0.35).attr('stroke-width',0.5);
+      g.append('text').attr('x',cx).attr('y',cy+2.8).attr('text-anchor','middle')
+        .attr('font-size',7.5).attr('font-weight',700).attr('font-family','var(--font)')
+        .attr('fill','#fff').attr('fill-opacity',ext?0.7:1).style('pointer-events','none')
+        .text(initials(who));
+    }
+
+    // Title — wrapped to two lines (fixed card size). Sits below the identifier
+    // row, so it clears the assignee disc without needing a width reservation.
     const titleEl=g.append('text')
       .attr('font-size',11).attr('font-family','var(--font)')
       .attr('fill','var(--text)').attr('fill-opacity',ext?0.4:0.85);
