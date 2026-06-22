@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Linear Dependency Graph</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:#ffffff; --bg2:#f5f5f3; --bg3:#ebebea;
+  --text:#1a1a19; --text2:#6b6b67; --text3:#9c9a92;
+  --border:rgba(0,0,0,0.12); --border2:rgba(0,0,0,0.22);
+  --radius:8px; --font:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --mono:ui-monospace,"SF Mono","Cascadia Code",monospace;
+  --c-done:#1D9E75; --c-progress:#378ADD; --c-todo:#888780;
+  --c-cancelled:#D85A30; --c-block:#E24B4A;
+}
+@media (prefers-color-scheme:dark) {
+  :root { --bg:#1c1c1b; --bg2:#252524; --bg3:#2e2e2c;
+    --text:#e8e6df; --text2:#9c9a92; --text3:#6b6b67;
+    --border:rgba(255,255,255,0.1); --border2:rgba(255,255,255,0.22); }
+}
+body { font-family:var(--font); background:var(--bg); color:var(--text); min-height:100vh; display:flex; flex-direction:column; }
+header { padding:14px 18px 12px; border-bottom:0.5px solid var(--border); background:var(--bg); flex-shrink:0; }
+h1 { font-size:14px; font-weight:500; margin-bottom:10px; color:var(--text2); }
+.controls { display:flex; flex-direction:column; gap:7px; }
+.row { display:flex; gap:7px; align-items:center; }
+input[type="password"],input[type="text"] {
+  height:30px; padding:0 9px; border:0.5px solid var(--border2);
+  border-radius:var(--radius); background:var(--bg2); color:var(--text);
+  font-size:12px; outline:none; transition:box-shadow 0.15s;
+}
+input[type="password"] { font-family:var(--mono); flex:1; }
+input.ii { width:148px; }
+input.fi { flex:1; }
+input:focus { box-shadow:0 0 0 2px rgba(55,138,221,0.2); }
+button {
+  height:30px; padding:0 12px; font-size:12px; font-weight:500;
+  font-family:var(--font); background:var(--bg2); border:0.5px solid var(--border2);
+  border-radius:var(--radius); color:var(--text); cursor:pointer; white-space:nowrap; transition:background 0.12s;
+}
+button:hover { background:var(--bg3); }
+button:active { transform:scale(0.98); }
+button:disabled { opacity:0.4; cursor:default; transform:none; }
+.kh { font-size:10px; color:var(--text3); }
+.kh a { color:var(--text3); }
+.sb {
+  padding:6px 18px; font-size:11px; color:var(--text2);
+  border-bottom:0.5px solid var(--border); min-height:30px;
+  display:flex; align-items:center; gap:12px; background:var(--bg); flex-shrink:0;
+}
+.sb.err { color:var(--c-block); }
+.legend { display:flex; gap:12px; font-size:11px; color:var(--text2); flex-wrap:wrap; margin-left:auto; }
+.li { display:flex; align-items:center; gap:4px; }
+.dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+#gw { flex:1; position:relative; overflow:hidden; background:var(--bg2); min-height:0; }
+#gw svg { display:block; cursor:grab; }
+#gw svg:active { cursor:grabbing; }
+.es {
+  position:absolute; inset:0; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:8px;
+  color:var(--text3); font-size:13px; pointer-events:none;
+}
+#tt {
+  position:absolute; pointer-events:none; background:var(--bg);
+  border:0.5px solid var(--border2); border-radius:var(--radius);
+  padding:8px 12px; font-size:11px; color:var(--text);
+  max-width:240px; display:none; z-index:100; line-height:1.6;
+  box-shadow:0 4px 16px rgba(0,0,0,0.12);
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Linear · dependency graph</h1>
+  <div class="controls">
+    <div class="row">
+      <input type="text" id="pi" class="ii" placeholder="Parent ID  e.g. FIL-273" spellcheck="false"/>
+      <button id="lb">Load</button>
+      <input type="text" id="fi" class="fi" placeholder="Filter by identifier or title…"/>
+      <button id="zf">Fit</button>
+      <button id="zr">1:1</button>
+    </div>
+    <div class="kh">API key loaded server-side from config.json — never sent to the browser.</div>
+  </div>
+</header>
+<div class="sb" id="sb">
+  <span id="st">Enter your Linear API key and a parent issue ID, then click Load.</span>
+  <div class="legend" id="legend" style="display:none">
+    <div class="li"><div class="dot" style="background:var(--c-done)"></div>Done</div>
+    <div class="li"><div class="dot" style="background:var(--c-progress)"></div>In progress</div>
+    <div class="li"><div class="dot" style="background:var(--c-todo)"></div>Todo/backlog</div>
+    <div class="li"><div class="dot" style="background:var(--c-cancelled)"></div>Cancelled</div>
+    <div class="li" style="margin-left:4px">
+      <svg width="22" height="10"><line x1="0" y1="5" x2="22" y2="5" stroke="var(--c-block)" stroke-width="1.5"/></svg>Blocks
+    </div>
+    <div class="li">
+      <svg width="22" height="10"><line x1="0" y1="5" x2="22" y2="5" stroke="var(--c-todo)" stroke-width="1" stroke-dasharray="3 2"/></svg>Related
+    </div>
+  </div>
+</div>
+<div id="gw">
+  <div class="es" id="es"><span style="font-size:28px;opacity:0.25">⬡</span><span>No issues loaded</span></div>
+  <svg id="svg"></svg>
+  <div id="tt"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script>
+const GQL = '/api/graphql';  // local proxy; key is injected server-side
+const NW = 172, NH = 44, HGAP = 40, VGAP = 88, R = 6;
+let allNodes=[], allLinks=[], zoomBeh, svgSel, gSel;
+let WORKSPACE = 'filecoin-foundation';  // overwritten from /api/meta
+
+const isDummy = id => typeof id === 'string' && id.startsWith('__d_');
+
+function stateColor(t) {
+  if (!t) return '#888780';
+  const s = t.toLowerCase();
+  if (s==='completed') return '#1D9E75';
+  if (s==='started')   return '#378ADD';
+  if (s==='cancelled') return '#D85A30';
+  return '#888780';
+}
+function setStatus(m, err=false) {
+  document.getElementById('st').textContent = m;
+  document.getElementById('sb').className = 'sb'+(err?' err':'');
+}
+
+// ── Linear API ───────────────────────────────────────────────────────────────
+async function gqlQ(query, vars={}) {
+  const r = await fetch(GQL, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({query, variables:vars})
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const j = await r.json();
+  if (j.errors?.length) throw new Error(j.errors[0].message);
+  return j.data;
+}
+const FRAG = `id identifier title state{type name}
+  relations(first:50){nodes{type relatedIssue{id identifier title state{type name}}}}`;
+async function loadIssues(pid) {
+  // issue(id:) accepts both the human identifier (e.g. "FIL-273") and the UUID
+  const pd = await gqlQ(`query($id:String!){issue(id:$id){${FRAG} children(first:250){nodes{${FRAG}}}}}`,{id:pid});
+  const par = pd.issue;
+  if (!par) throw new Error(`Issue "${pid}" not found.`);
+  // children(first:) is available directly on the parent — use it instead of a filter query
+  const ch = par.children?.nodes || [];
+  return [par, ...ch.filter(c=>c.id!==par.id)];
+}
+
+// ── Graph build ──────────────────────────────────────────────────────────────
+function buildGraph(issues) {
+  const nm = new Map();
+  issues.forEach(i => nm.set(i.id, {id:i.id,identifier:i.identifier,title:i.title,
+    stateType:i.state?.type, stateName:i.state?.name, external:false}));
+  const links=[], seen=new Set();
+  issues.forEach(iss => {
+    (iss.relations?.nodes||[]).forEach(rel => {
+      const ri = rel.relatedIssue; if (!ri) return;
+      // Skip blocked_by — it's the mirror of blocks from the other side
+      if (rel.type==='blocked_by') return;
+      if (!nm.has(ri.id)) nm.set(ri.id,{id:ri.id,identifier:ri.identifier,title:ri.title,
+        stateType:ri.state?.type, stateName:ri.state?.name, external:true});
+      const key=`${iss.id}|${ri.id}|${rel.type}`;
+      if (seen.has(key)) return; seen.add(key);
+      links.push({source:iss.id, target:ri.id, type:rel.type});
+    });
+  });
+  return {nodes:[...nm.values()], links};
+}
+
+// ── Sugiyama pipeline ────────────────────────────────────────────────────────
+
+// 1. Longest-path layer assignment
+function assignLayers(nodes, links) {
+  const bl = links.filter(l=>l.type==='blocks');
+  const inE = new Map(nodes.map(n=>[n.id,[]]));
+  bl.forEach(l=>{ if(inE.has(l.target)) inE.get(l.target).push(l.source); });
+  const rank=new Map(), vis=new Set();
+  function dfs(id) {
+    if (vis.has(id)) return rank.get(id)??0;
+    vis.add(id);
+    const preds=inE.get(id)||[];
+    const r = preds.length===0 ? 0 : Math.max(...preds.map(p=>dfs(p)))+1;
+    rank.set(id,r); return r;
+  }
+  nodes.forEach(n=>dfs(n.id));
+  nodes.forEach(n=>{ if(!rank.has(n.id)) rank.set(n.id,0); });
+  return rank;
+}
+
+// 2. Dummy node insertion for edges spanning >1 layer
+function insertDummies(nodes, links, rank) {
+  const augNodes=[...nodes], augLinks=[];
+  let di=0;
+  links.filter(l=>l.type==='blocks').forEach(l => {
+    const rs=rank.get(l.source), rt=rank.get(l.target);
+    if (rt-rs<=1) { augLinks.push({...l}); return; }
+    let prev=l.source;
+    for (let r=rs+1; r<rt; r++) {
+      const did=`__d_${di++}`;
+      augNodes.push({id:did,dummy:true});
+      rank.set(did,r);
+      augLinks.push({source:prev,target:did,type:'blocks',orig:{source:l.source,target:l.target}});
+      prev=did;
+    }
+    augLinks.push({source:prev,target:l.target,type:'blocks',orig:{source:l.source,target:l.target}});
+  });
+  links.filter(l=>l.type!=='blocks').forEach(l=>augLinks.push({...l}));
+  return {augNodes,augLinks};
+}
+
+// 3. Build layer arrays
+function buildLayers(augNodes, rank) {
+  const layers=[];
+  augNodes.forEach(n=>{
+    const r=rank.get(n.id)??0;
+    while(layers.length<=r) layers.push([]);
+    layers[r].push(n.id);
+  });
+  return layers;
+}
+
+// 4. Crossing minimisation — barycenter heuristic, 24 alternating sweeps
+function minimizeCrossings(layers, augLinks) {
+  const bl=augLinks.filter(l=>l.type==='blocks');
+  const succs=new Map(), preds=new Map();
+  layers.forEach(layer=>layer.forEach(id=>{ succs.set(id,[]); preds.set(id,[]); }));
+  bl.forEach(l=>{
+    if(succs.has(l.source)) succs.get(l.source).push(l.target);
+    if(preds.has(l.target)) preds.get(l.target).push(l.source);
+  });
+  function posMap(layer){ const m=new Map(); layer.forEach((id,i)=>m.set(id,i)); return m; }
+  function bary(layer, neighborFn, pm) {
+    const scores=layer.map(id=>{
+      const ns=neighborFn(id).filter(n=>pm.has(n));
+      return {id, score: ns.length ? ns.reduce((s,n)=>s+pm.get(n),0)/ns.length : Infinity};
+    });
+    // stable sort: Infinity items keep relative position
+    let infPos=0;
+    const infItems=scores.filter(s=>s.score===Infinity);
+    return scores.sort((a,b)=>a.score===Infinity&&b.score===Infinity?0:a.score-b.score).map(s=>s.id);
+  }
+  for (let sw=0; sw<24; sw++) {
+    if (sw%2===0) {
+      for (let i=1;i<layers.length;i++) {
+        layers[i]=bary(layers[i], id=>preds.get(id)||[], posMap(layers[i-1]));
+      }
+    } else {
+      for (let i=layers.length-2;i>=0;i--) {
+        layers[i]=bary(layers[i], id=>succs.get(id)||[], posMap(layers[i+1]));
+      }
+    }
+  }
+  return layers;
+}
+
+// 5. Assign coordinates, centre each layer
+function assignCoords(layers) {
+  const pos=new Map();
+  const maxLayerW=Math.max(...layers.map(l=>l.length*(NW+HGAP)-HGAP));
+  layers.forEach((layer,ri)=>{
+    const layerW=layer.length*(NW+HGAP)-HGAP;
+    const offsetX=(maxLayerW-layerW)/2;
+    layer.forEach((id,ci)=>{
+      const x=offsetX+ci*(NW+HGAP), y=ri*(NH+VGAP);
+      pos.set(id,{x,y,cx:x+NW/2,cy:y+NH/2,bx:x+NW/2,by:y+NH,tx:x+NW/2,ty:y});
+    });
+  });
+  const PAD=48;
+  const W=maxLayerW+PAD*2, H=layers.length*(NH+VGAP)-VGAP+PAD*2;
+  pos.forEach(p=>{ p.x+=PAD; p.cx+=PAD; p.bx+=PAD; p.tx+=PAD; p.y+=PAD; p.cy+=PAD; p.by+=PAD; p.ty+=PAD; });
+  return {pos,W,H};
+}
+
+// 6. Reconstruct chains through dummies → list of {from, to, waypoints:[positions]}
+function buildChains(augLinks, pos) {
+  // Build next-map: source → target for block links
+  const nextMap=new Map();
+  augLinks.filter(l=>l.type==='blocks').forEach(l=>nextMap.set(l.source,l.target));
+
+  // Find all real-source, real-target pairs
+  const chains=[];
+  const usedSrc=new Set();
+  augLinks.filter(l=>l.type==='blocks').forEach(l=>{
+    if (isDummy(l.source)) return; // start from real nodes only
+    const chainKey=`${l.source}`;
+    if (usedSrc.has(chainKey+l.target)) return;
+    // walk the chain
+    let cur=l.source;
+    const visited=[cur];
+    while (nextMap.has(cur)) {
+      cur=nextMap.get(cur);
+      if (visited.includes(cur)) break; // cycle guard
+      visited.push(cur);
+      if (!isDummy(cur)) {
+        // real target found — emit chain from l.source to cur
+        const key=`${l.source}->${cur}`;
+        if (!usedSrc.has(key)) {
+          usedSrc.add(key);
+          const wps=visited.map(id=>pos.get(id)).filter(Boolean);
+          if (wps.length>=2) chains.push({from:l.source,to:cur,wps});
+        }
+        break;
+      }
+    }
+  });
+  return chains;
+}
+
+// 7. Build orthogonal path points for one chain
+// Strategy: exit bottom-centre of source, travel to mid-gap Y, 
+// go horizontal to target x, enter top-centre of target.
+// For multi-layer chains: route through each inter-layer midpoint.
+function chainToPoints(wps) {
+  const pts=[];
+  for (let i=0;i<wps.length-1;i++) {
+    const p=wps[i], q=wps[i+1];
+    const srcBottom={x:p.bx, y:p.by};
+    const tgtTop={x:q.tx, y:q.ty};
+    const midY=(p.by+q.ty)/2;
+    if (i===0) pts.push(srcBottom);
+    pts.push({x:p.bx, y:midY});
+    pts.push({x:q.tx, y:midY});
+    if (i===wps.length-2) pts.push(tgtTop);
+  }
+  return pts;
+}
+
+// Deduplicate consecutive identical points
+function dedupPts(pts) {
+  return pts.filter((p,i)=>i===0||Math.abs(p.x-pts[i-1].x)>0.01||Math.abs(p.y-pts[i-1].y)>0.01);
+}
+
+// Build SVG path string with rounded corners (quadratic bezier at bends)
+function orthoPath(pts, r) {
+  pts=dedupPts(pts);
+  if (pts.length<2) return '';
+  let d=`M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`;
+  for (let i=1;i<pts.length;i++) {
+    const prev=pts[i-1], cur=pts[i], next=pts[i+1];
+    if (!next) { d+=` L ${cur.x.toFixed(1)} ${cur.y.toFixed(1)}`; continue; }
+    const dx1=cur.x-prev.x, dy1=cur.y-prev.y;
+    const dx2=next.x-cur.x, dy2=next.y-cur.y;
+    const len1=Math.sqrt(dx1*dx1+dy1*dy1), len2=Math.sqrt(dx2*dx2+dy2*dy2);
+    if (len1<0.01||len2<0.01) { d+=` L ${cur.x.toFixed(1)} ${cur.y.toFixed(1)}`; continue; }
+    const ar=Math.min(r, len1/2, len2/2);
+    const bx=cur.x-(dx1/len1)*ar, by=cur.y-(dy1/len1)*ar;
+    const ax=cur.x+(dx2/len2)*ar, ay=cur.y+(dy2/len2)*ar;
+    d+=` L ${bx.toFixed(1)} ${by.toFixed(1)} Q ${cur.x.toFixed(1)} ${cur.y.toFixed(1)} ${ax.toFixed(1)} ${ay.toFixed(1)}`;
+  }
+  return d;
+}
+
+// ── Render ───────────────────────────────────────────────────────────────────
+function render(nodes, links, filterText='') {
+  const wrap=document.getElementById('gw');
+  const svgEl=document.getElementById('svg');
+  const emptyEl=document.getElementById('es');
+  const tooltip=document.getElementById('tt');
+  svgEl.innerHTML='';
+
+  const ft=filterText.toLowerCase().trim();
+  let visNodes=nodes, visLinks=links;
+  if (ft) {
+    const mids=new Set(nodes.filter(n=>
+      n.identifier?.toLowerCase().includes(ft)||n.title?.toLowerCase().includes(ft)
+    ).map(n=>n.id));
+    links.forEach(l=>{ if(mids.has(l.source)) mids.add(l.target); if(mids.has(l.target)) mids.add(l.source); });
+    visNodes=nodes.filter(n=>mids.has(n.id));
+    const vs=new Set(visNodes.map(n=>n.id));
+    visLinks=links.filter(l=>vs.has(l.source)&&vs.has(l.target));
+  }
+
+  if (!visNodes.length) {
+    svgEl.style.display='none'; emptyEl.style.display='flex';
+    emptyEl.querySelector('span:last-child').textContent=ft?'No issues match.':'No issues loaded.';
+    return;
+  }
+  svgEl.style.display='block'; emptyEl.style.display='none';
+
+  // Pipeline
+  const rank=assignLayers(visNodes, visLinks);
+  const {augNodes,augLinks}=insertDummies(visNodes, visLinks, rank);
+  let layers=buildLayers(augNodes, rank);
+  layers=minimizeCrossings(layers, augLinks);
+  const {pos,W,H}=assignCoords(layers);
+
+  // SVG
+  const wW=wrap.clientWidth, wH=wrap.clientHeight;
+  svgSel=d3.select(svgEl).attr('width',Math.max(W,wW)).attr('height',Math.max(H,wH));
+
+  const defs=svgSel.append('defs');
+  [['ab','#E24B4A',8],['ar','#888780',6]].forEach(([id,col,rx])=>{
+    defs.append('marker').attr('id',id).attr('viewBox','0 0 10 10')
+      .attr('refX',rx).attr('refY',5).attr('markerWidth',5).attr('markerHeight',5)
+      .attr('orient','auto-start-reverse')
+      .append('path').attr('d','M2 1L8 5L2 9').attr('fill','none')
+      .attr('stroke',col).attr('stroke-width',1.5).attr('stroke-linecap','round').attr('stroke-linejoin','round');
+  });
+
+  gSel=svgSel.append('g');
+  zoomBeh=d3.zoom().scaleExtent([0.06,5]).on('zoom',e=>gSel.attr('transform',e.transform));
+  svgSel.call(zoomBeh);
+
+  // Related edges — simple curved arcs, behind everything
+  const relEdges=gSel.append('g').attr('class','rel-edges');
+  visLinks.filter(l=>l.type==='related').forEach(l=>{
+    const ps=pos.get(l.source), pt=pos.get(l.target); if(!ps||!pt) return;
+    // Arc from right side of source to right side of target, curves outward
+    const x1=ps.x+NW, y1=ps.cy, x2=pt.x+NW, y2=pt.cy;
+    const bulge=Math.abs(y2-y1)*0.5+40;
+    const mx=Math.max(x1,x2)+bulge;
+    relEdges.append('path')
+      .attr('d',`M ${x1} ${y1} C ${mx} ${y1} ${mx} ${y2} ${x2} ${y2}`)
+      .attr('fill','none').attr('stroke','#888780').attr('stroke-width',0.8)
+      .attr('stroke-dasharray','3 2').attr('stroke-opacity',0.4)
+      .attr('marker-end','url(#ar)');
+  });
+
+  // Blocks edges — orthogonal
+  const blockEdges=gSel.append('g').attr('class','block-edges');
+  const chains=buildChains(augLinks, pos);
+  chains.forEach(({wps})=>{
+    const pts=chainToPoints(wps);
+    blockEdges.append('path')
+      .attr('d',orthoPath(pts,R))
+      .attr('fill','none').attr('stroke','#E24B4A').attr('stroke-width',1.2)
+      .attr('stroke-opacity',0.72).attr('marker-end','url(#ab)');
+  });
+
+  // Nodes
+  const nodeG=gSel.append('g').attr('class','nodes');
+  visNodes.forEach(n=>{
+    const p=pos.get(n.id); if(!p) return;
+    const col=stateColor(n.stateType), ext=n.external;
+    const g=nodeG.append('g').attr('transform',`translate(${p.x},${p.y})`).style('cursor','pointer')
+      .on('mouseover', ()=>{
+        const bMe=visLinks.filter(l=>l.target===n.id&&l.type==='blocks')
+          .map(l=>visNodes.find(x=>x.id===l.source)?.identifier||l.source);
+        const iBlk=visLinks.filter(l=>l.source===n.id&&l.type==='blocks')
+          .map(l=>visNodes.find(x=>x.id===l.target)?.identifier||l.target);
+        let h=`<strong>${n.identifier}</strong><br>${n.title}`;
+        if (n.stateName) h+=`<br><span style="opacity:0.6">${n.stateName}</span>`;
+        if (bMe.length) h+=`<br><span style="color:var(--c-block)">Blocked by: ${bMe.join(', ')}</span>`;
+        if (iBlk.length) h+=`<br><span style="color:var(--c-block)">Blocks: ${iBlk.join(', ')}</span>`;
+        if (ext) h+=`<br><span style="opacity:0.45"><em>External</em></span>`;
+        tooltip.innerHTML=h; tooltip.style.display='block';
+      })
+      .on('mousemove', e=>{
+        const rect=wrap.getBoundingClientRect();
+        let x=e.clientX-rect.left+12, y=e.clientY-rect.top-8;
+        if(x+252>wrap.clientWidth) x-=264;
+        tooltip.style.left=x+'px'; tooltip.style.top=y+'px';
+      })
+      .on('mouseout',()=>tooltip.style.display='none')
+      .on('click',()=>window.open(`https://linear.app/${WORKSPACE}/issue/${n.identifier}`,'_blank'));
+
+    // Card background
+    g.append('rect').attr('width',NW).attr('height',NH).attr('rx',6)
+      .attr('fill',col).attr('fill-opacity',ext?0.07:0.10)
+      .attr('stroke',col).attr('stroke-width',ext?0.5:1).attr('stroke-opacity',ext?0.4:0.8);
+
+    // Left accent bar
+    g.append('rect').attr('x',0).attr('y',5).attr('width',3).attr('height',NH-10).attr('rx',1.5)
+      .attr('fill',col).attr('fill-opacity',ext?0.35:0.9);
+
+    // Identifier label
+    g.append('text').attr('x',11).attr('y',16)
+      .attr('font-size',10).attr('font-weight',600).attr('font-family','var(--font)')
+      .attr('fill',col).attr('fill-opacity',ext?0.55:1)
+      .text(n.identifier);
+
+    // Title
+    const t=n.title.length>23?n.title.slice(0,22)+'…':n.title;
+    g.append('text').attr('x',11).attr('y',31)
+      .attr('font-size',11).attr('font-family','var(--font)')
+      .attr('fill','var(--text)').attr('fill-opacity',ext?0.4:0.85)
+      .text(t);
+  });
+
+  // Initial fit
+  const sc=Math.min(1,Math.min((wW-64)/W,(wH-64)/H));
+  const tx=(wW-W*sc)/2, ty=(wH-H*sc)/2;
+  svgSel.call(zoomBeh.transform, d3.zoomIdentity.translate(tx,ty).scale(sc));
+}
+
+function triggerFit() {
+  if (!svgSel||!gSel||!zoomBeh) return;
+  const wrap=document.getElementById('gw');
+  const bb=gSel.node().getBBox();
+  const wW=wrap.clientWidth, wH=wrap.clientHeight, PAD=32;
+  const sc=Math.min(1,Math.min((wW-PAD*2)/bb.width,(wH-PAD*2)/bb.height));
+  const tx=(wW-bb.width*sc)/2-bb.x*sc, ty=(wH-bb.height*sc)/2-bb.y*sc;
+  svgSel.transition().duration(400).call(zoomBeh.transform, d3.zoomIdentity.translate(tx,ty).scale(sc));
+}
+
+// ── Controls ─────────────────────────────────────────────────────────────────
+document.getElementById('lb').addEventListener('click', async ()=>{
+  const pid=document.getElementById('pi').value.trim().toUpperCase();
+  if (!pid)  { setStatus('Enter a parent issue identifier.',true); return; }
+  const btn=document.getElementById('lb');
+  btn.disabled=true; btn.textContent='Loading…';
+  setStatus('Fetching from Linear…');
+  try {
+    const issues=await loadIssues(pid);
+    const {nodes,links}=buildGraph(issues);
+    allNodes=nodes; allLinks=links;
+    document.getElementById('legend').style.display='flex';
+    const nb=links.filter(l=>l.type==='blocks').length;
+    setStatus(`${issues.length} issues · ${nb} blocking relation${nb!==1?'s':''} · click to open in Linear`);
+    render(allNodes,allLinks,document.getElementById('fi').value);
+  } catch(e) { setStatus('Error: '+e.message,true); console.error(e); }
+  finally { btn.disabled=false; btn.textContent='Reload'; }
+});
+document.getElementById('fi').addEventListener('input', e=>{ if(allNodes.length) render(allNodes,allLinks,e.target.value); });
+document.getElementById('zf').addEventListener('click', triggerFit);
+document.getElementById('zr').addEventListener('click', ()=>{
+  if(svgSel&&zoomBeh) svgSel.transition().duration(350).call(zoomBeh.transform,d3.zoomIdentity);
+});
+document.getElementById('pi').addEventListener('keydown',e=>{
+  if(e.key==='Enter') document.getElementById('lb').click();
+});
+window.addEventListener('resize', ()=>{ if(allNodes.length) render(allNodes,allLinks,document.getElementById('fi').value); });
+
+// Pick up the workspace slug (for click-to-open links) from the server config.
+fetch('/api/meta').then(r=>r.json()).then(m=>{ if(m.workspace) WORKSPACE=m.workspace; }).catch(()=>{});
+</script>
+</body>
+</html>
