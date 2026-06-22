@@ -689,37 +689,75 @@ function routeChains(chains, pos) {
     });
   });
 
-  // ── Lanes: each chain crosses one or more inter-layer gaps. For each gap,
-  // give every horizontal segment crossing it a distinct Y so they don't merge.
-  // A gap is keyed by the source waypoint's bottom-Y (rows are uniform).
-  const gapMembers = new Map();   // gapKey -> [{chain, segIndex}]
+  // ── Lanes (per-source buses): route every edge leaving the SAME node into a
+  // gap through ONE shared horizontal "bus" lane. A single node's fan-out then
+  // can never self-cross (trunk/ports → bus → tap straight down to each child).
+  // Within a gap, the buses (one per source, plus one per dummy pass-through)
+  // are ordered top↔bottom to minimise the remaining cross-source crossings.
+  const gapBuses = new Map();   // gapKey -> Map(busKey -> bus)
   chains.forEach(c => {
     for (let i=0;i<c.wps.length-1;i++) {
-      const key = c.wps[i].by.toFixed(1);
-      if (!gapMembers.has(key)) gapMembers.set(key, []);
-      gapMembers.get(key).push({chain:c, segIndex:i});
+      const gapKey = c.wps[i].by.toFixed(1);
+      // first hop groups by real source; deeper hops are per dummy pass-through
+      const busKey = i===0 ? 's'+c.from : 'w'+c.wps[i].cx.toFixed(1);
+      if (!gapBuses.has(gapKey)) gapBuses.set(gapKey, new Map());
+      const m = gapBuses.get(gapKey);
+      if (!m.has(busKey)) m.set(busKey, {members:[], top:c.wps[i].by, bot:c.wps[i+1].ty, ux:c.wps[i].cx});
+      m.get(busKey).members.push({chain:c, segIndex:i});
     }
   });
-
-  const laneY = new Map();        // chain+seg -> y of its horizontal run
-  gapMembers.forEach((members, key) => {
-    // The gap spans from by (top of gap) to next row's ty.
-    const sample = members[0];
-    const top = sample.chain.wps[sample.segIndex].by;
-    const bot = sample.chain.wps[sample.segIndex+1].ty;
-    const span = bot - top;
-    // Order lanes left-to-right by where the horizontal run starts, so lanes
-    // nest sensibly and crossings are reduced.
-    members.sort((a,b)=>{
-      const ax = a.segIndex===0 ? a.chain.exitX : a.chain.wps[a.segIndex].cx;
-      const bx = b.segIndex===0 ? b.chain.exitX : b.chain.wps[b.segIndex].cx;
-      return ax-bx;
+  // geometry of a bus: x's of verticals entering from above (ins) / leaving below
+  // (outs), and the horizontal span [lo,hi].
+  function busGeom(bus){
+    const ins=[], outs=[]; let lo=Infinity, hi=-Infinity;
+    bus.members.forEach(({chain,segIndex})=>{
+      const sx = segIndex===0 ? chain.exitX : chain.wps[segIndex].cx;
+      const ex = segIndex===chain.wps.length-2 ? chain.entryX : chain.wps[segIndex+1].cx;
+      ins.push(sx); outs.push(ex); lo=Math.min(lo,sx,ex); hi=Math.max(hi,sx,ex);
     });
-    const n = members.length;
-    members.forEach((m,idx)=>{
-      // distribute lanes across the central ~70% of the gap
+    return {ins,outs,lo,hi};
+  }
+  // crossings for a top→bottom bus ordering: a above b ⇒ a's down-taps cross b's
+  // span, and b's up-taps cross a's span.
+  function orderCross(order){
+    const g=order.map(busGeom); let c=0;
+    for(let a=0;a<order.length;a++) for(let b=a+1;b<order.length;b++){
+      g[a].outs.forEach(x=>{ if(x>g[b].lo+0.5 && x<g[b].hi-0.5) c++; });
+      g[b].ins.forEach(x=>{ if(x>g[a].lo+0.5 && x<g[a].hi-0.5) c++; });
+    }
+    return c;
+  }
+  function permOrder(arr){ if(arr.length<=1) return [arr]; const r=[];
+    arr.forEach((v,i)=>{ const rest=arr.slice(0,i).concat(arr.slice(i+1)); permOrder(rest).forEach(p=>r.push([v,...p])); }); return r; }
+  function bestOrder(buses){
+    const seed=[...buses].sort((a,b)=>a.ux-b.ux);   // left-to-right by source x
+    if(buses.length<=6){                            // small gaps: optimal
+      let best=seed, bc=orderCross(seed);
+      permOrder(buses).forEach(o=>{ const c=orderCross(o); if(c<bc){bc=c; best=o;} });
+      return best;
+    }
+    let order=seed, improved=true, guard=0;          // larger gaps: transpose-refine
+    while(improved && guard++<20){
+      improved=false;
+      for(let i=0;i<order.length-1;i++){
+        const before=orderCross(order);
+        [order[i],order[i+1]]=[order[i+1],order[i]];
+        if(orderCross(order)<before) improved=true;
+        else [order[i],order[i+1]]=[order[i+1],order[i]];
+      }
+    }
+    return order;
+  }
+
+  const laneY = new Map();        // chain+seg -> y of its horizontal run (its bus)
+  gapBuses.forEach(m=>{
+    const order=bestOrder([...m.values()]);
+    const n=order.length;
+    order.forEach((bus,idx)=>{
+      const span=bus.bot-bus.top;
       const t = n===1 ? 0.5 : 0.15 + 0.7*(idx/(n-1));
-      laneY.set(m.chain.id+':'+m.segIndex, top + span*t);
+      const y = bus.top + span*t;
+      bus.members.forEach(({chain,segIndex})=>laneY.set(chain.id+':'+segIndex, y));
     });
   });
 
