@@ -262,22 +262,26 @@ function regionRank(nodes, links) {
   return {rank, regionTiers, offset, nodeRegion};
 }
 
-// 2. Dummy node insertion for edges spanning >1 layer
-function insertDummies(nodes, links, rank) {
+// 2. Dummy node insertion for edges spanning >1 layer. Each augmented link is
+// tagged `bb` (is it part of a backbone edge?) so the dummy chain of a backbone
+// edge stays alignable end-to-end.
+function insertDummies(nodes, links, rank, backbone) {
+  const isBB=l=> backbone ? backbone.has(l.source+'|'+l.target) : false;
   const augNodes=[...nodes], augLinks=[];
   let di=0;
   links.filter(l=>l.type==='blocks').forEach(l => {
+    const bb=isBB(l);
     const rs=rank.get(l.source), rt=rank.get(l.target);
-    if (rt-rs<=1) { augLinks.push({...l}); return; }
+    if (rt-rs<=1) { augLinks.push({...l, bb}); return; }
     let prev=l.source;
     for (let r=rs+1; r<rt; r++) {
       const did=`__d_${di++}`;
       augNodes.push({id:did,dummy:true});
       rank.set(did,r);
-      augLinks.push({source:prev,target:did,type:'blocks',orig:{source:l.source,target:l.target}});
+      augLinks.push({source:prev,target:did,type:'blocks',bb,orig:{source:l.source,target:l.target}});
       prev=did;
     }
-    augLinks.push({source:prev,target:l.target,type:'blocks',orig:{source:l.source,target:l.target}});
+    augLinks.push({source:prev,target:l.target,type:'blocks',bb,orig:{source:l.source,target:l.target}});
   });
   links.filter(l=>l.type!=='blocks').forEach(l=>augLinks.push({...l}));
   return {augNodes,augLinks};
@@ -379,6 +383,32 @@ function minimizeCrossings(layers, augLinks) {
     return best.order;
   }
 
+  // crossings on layer r against only its neighbours (for local swap decisions)
+  function localCross(ls, r){
+    let c=0;
+    if(r>0)            c+=crossingsBetween(ls[r-1], ls[r],   posMap(ls[r]));
+    if(r<ls.length-1)  c+=crossingsBetween(ls[r],   ls[r+1], posMap(ls[r+1]));
+    return c;
+  }
+  // Transposition refinement (Gansner et al.): repeatedly swap adjacent nodes in
+  // a layer while the swap doesn't increase local crossings. Catches optima that
+  // median/barycenter sweeps can't reach — the single biggest quality lever here.
+  function transpose(ls){
+    let improved=true, guard=0;
+    while(improved && guard++<10){
+      improved=false;
+      for(let r=0;r<ls.length;r++){
+        for(let i=0;i<ls[r].length-1;i++){
+          const before=localCross(ls,r);
+          [ls[r][i],ls[r][i+1]]=[ls[r][i+1],ls[r][i]];
+          const after=localCross(ls,r);
+          if(after<before) improved=true;
+          else [ls[r][i],ls[r][i+1]]=[ls[r][i+1],ls[r][i]];   // revert
+        }
+      }
+    }
+  }
+
   let best=layers.map(l=>[...l]);
   let bestC=totalCrossings(best);
   let stale=0;                          // sweeps since last improvement
@@ -396,6 +426,7 @@ function minimizeCrossings(layers, augLinks) {
           : medianOrder(layers[i], id=>succs.get(id)||[], posMap(layers[i+1]));
       }
     }
+    transpose(layers);                  // local-swap refinement after each sweep
     const c=totalCrossings(layers);
     if(c<bestC){ bestC=c; best=layers.map(l=>[...l]); stale=0; } else { stale++; }
   }
@@ -419,67 +450,105 @@ function assignCoords(layers, augLinks, regionInfo) {
   const idLayer=new Map(), idIdx=new Map();
   layers.forEach((layer,ri)=>layer.forEach((id,ci)=>{ idLayer.set(id,ri); idIdx.set(id,ci); }));
 
-  // upper neighbours (preds) for alignment
+  // ── Tidy-tree x-assignment over the backbone forest ──
+  // Each node is centred over its backbone children; sibling subtrees occupy
+  // disjoint horizontal ranges, so the layout reads like a clean tech tree with
+  // zero backbone crossings. Sibling/root left-right order comes from the
+  // crossing-minimised layer order, so secondary edges are arranged sensibly too.
   const bl=(augLinks||[]).filter(l=>l.type==='blocks');
-  const preds=new Map(); layers.forEach(l=>l.forEach(id=>preds.set(id,[])));
-  bl.forEach(l=>{ if(preds.has(l.target)) preds.get(l.target).push(l.source); });
+  const bbParent=new Map(), bbKids=new Map(), dummyOrig=new Map();
+  const seenBB=new Set();
+  bl.forEach(l=>{
+    if(l.orig){ if(isDummy(l.target)) dummyOrig.set(l.target,l.orig);
+                if(isDummy(l.source)) dummyOrig.set(l.source,l.orig); }
+    if(!l.bb) return;
+    const s=l.orig?l.orig.source:l.source, t=l.orig?l.orig.target:l.target;  // collapse dummy chains
+    const key=s+'|'+t; if(seenBB.has(key)) return; seenBB.add(key);
+    bbParent.set(t,s);
+    if(!bbKids.has(s)) bbKids.set(s,[]);
+    bbKids.get(s).push(t);
+  });
+  bbKids.forEach(kids=>kids.sort((a,b)=>(idIdx.get(a)??0)-(idIdx.get(b)??0)));
 
-  // 1. Alignment: walk layers top→down, align each node to its median upper
-  // neighbour if that neighbour isn't already claimed by a node to our left
-  // (prevents crossing alignments).
-  const align=new Map();   // node -> node it's aligned with in the layer above (root chain)
-  const root=new Map();    // node -> root of its vertical block
-  layers.forEach(l=>l.forEach(id=>{ align.set(id,id); root.set(id,id); }));
-  function findRoot(id){ let r=id; while(root.get(r)!==r) r=root.get(r); return r; }
+  const realIds=layers.flat().filter(id=>!isDummy(id));
+  const roots=realIds.filter(id=>!bbParent.has(id))
+    .sort((a,b)=>(idLayer.get(a)-idLayer.get(b))||(idIdx.get(a)-idIdx.get(b)));
 
-  for(let ri=1; ri<layers.length; ri++){
-    let lastUpperIdx=-1;   // enforce no-cross: chosen upper idx must increase
-    layers[ri].forEach(id=>{
-      const ups=(preds.get(id)||[]).filter(u=>idLayer.get(u)===ri-1)
-        .map(u=>({u, idx:idIdx.get(u)})).sort((a,b)=>a.idx-b.idx);
-      if(!ups.length) return;
-      const m=ups.length, mid=(m-1)/2;
-      // median candidate(s)
-      const cands=[ups[Math.floor(mid)], ups[Math.ceil(mid)]];
-      for(const c of cands){
-        if(c.idx>lastUpperIdx){
-          align.set(id, c.u);
-          root.set(id, findRoot(c.u));     // join the upper node's block
-          lastUpperIdx=c.idx;
-          break;
-        }
-      }
-    });
-  }
-
-  // 2. Desired x per node = its index slot; we want aligned nodes to share x.
-  // Compute a target x for each block as the max of member slot-x, then place
-  // each layer left to right respecting SEP and nudging toward block target.
-  const pos=new Map();
-  // initial x by slot
+  // Contour-based packing (Walker's algorithm): lay out each subtree in a local
+  // frame, then nestle sibling subtrees as close as their per-rank silhouettes
+  // allow — a deep narrow branch tucks beside a shallow wide one — so the tree
+  // stays compact instead of reserving a full column band per leaf. x = left edge.
   const x=new Map();
-  layers.forEach(layer=>layer.forEach((id,ci)=>x.set(id, ci*SEP)));
-
-  // For each block (group by root), set every member to the average of members'
-  // current x, then resolve overlaps within each layer by left-packing.
-  const blocks=new Map();
-  layers.forEach(layer=>layer.forEach(id=>{
-    const r=findRoot(id); if(!blocks.has(r)) blocks.set(r,[]); blocks.get(r).push(id);
-  }));
-  // a few relaxation rounds: align block, then de-overlap layers
-  for(let pass=0; pass<6; pass++){
-    blocks.forEach(members=>{
-      const ax=members.reduce((s,id)=>s+x.get(id),0)/members.length;
-      members.forEach(id=>x.set(id,ax));
-    });
-    // de-overlap each layer left→right
-    layers.forEach(layer=>{
-      for(let i=1;i<layer.length;i++){
-        const minX=x.get(layer[i-1])+SEP;
-        if(x.get(layer[i])<minX) x.set(layer[i],minX);
-      }
-    });
+  const placed=new Set();
+  function mergeInto(acc, c){                       // widen acc contour by c
+    c.min.forEach((v,r)=>acc.min.set(r, acc.min.has(r)?Math.min(acc.min.get(r),v):v));
+    c.max.forEach((v,r)=>acc.max.set(r, acc.max.has(r)?Math.max(acc.max.get(r),v):v));
   }
+  function shiftSub(sub, d){                         // translate a whole subtree
+    sub.nodes.forEach(n=>x.set(n, x.get(n)+d));
+    const nmin=new Map(), nmax=new Map();
+    sub.c.min.forEach((v,r)=>nmin.set(r,v+d));
+    sub.c.max.forEach((v,r)=>nmax.set(r,v+d));
+    sub.c={min:nmin,max:nmax};
+  }
+  // place a list of sibling subtrees left→right with min-SEP clearance per rank
+  function packSiblings(subs){
+    const acc={min:new Map(),max:new Map()};
+    subs.forEach((sub,i)=>{
+      if(i>0){
+        let shift=0;
+        sub.c.min.forEach((v,r)=>{ if(acc.max.has(r)) shift=Math.max(shift, acc.max.get(r)+SEP-v); });
+        if(shift) shiftSub(sub, shift);
+      }
+      mergeInto(acc, sub.c);
+    });
+    return acc;
+  }
+  function layoutSubtree(id){                        // → {nodes, c:{min,max}}
+    placed.add(id);
+    const r=idLayer.get(id);
+    const kids=(bbKids.get(id)||[]).filter(k=>!isDummy(k)&&!placed.has(k));
+    if(!kids.length){
+      x.set(id,0);
+      return {nodes:[id], c:{min:new Map([[r,0]]), max:new Map([[r,0]])}};
+    }
+    const subs=kids.map(layoutSubtree);
+    packSiblings(subs);
+    const cxs=kids.map(k=>x.get(k));
+    x.set(id, (Math.min(...cxs)+Math.max(...cxs))/2);  // centre over children
+    const nodes=[id].concat(...subs.map(s=>s.nodes));
+    const c={min:new Map(),max:new Map()};
+    subs.forEach(s=>mergeInto(c,s.c));
+    c.min.set(r, c.min.has(r)?Math.min(c.min.get(r),x.get(id)):x.get(id));
+    c.max.set(r, c.max.has(r)?Math.max(c.max.get(r),x.get(id)):x.get(id));
+    return {nodes, c};
+  }
+  // lay out every root subtree, then pack the roots together too
+  const rootSubs=roots.map(rid=>placed.has(rid)?null:layoutSubtree(rid)).filter(Boolean);
+  realIds.forEach(id=>{ if(!placed.has(id)) rootSubs.push(layoutSubtree(id)); }); // stragglers
+  packSiblings(rootSubs);
+
+  // Dummy waypoints: interpolate x along their original edge by rank fraction.
+  const pos=new Map();
+  layers.flat().forEach(id=>{
+    if(!isDummy(id)) return;
+    const o=dummyOrig.get(id);
+    const xs=o&&x.get(o.source), xt=o&&x.get(o.target);
+    if(xs==null||xt==null){ x.set(id, xs??xt??0); return; }
+    const rs=idLayer.get(o.source)??0, rt=idLayer.get(o.target)??0, rd=idLayer.get(id);
+    const f=(rt===rs)?0.5:(rd-rs)/(rt-rs);
+    x.set(id, xs+(xt-xs)*f);
+  });
+
+  // Safety de-overlap among real cards per layer (tidy-tree already separates
+  // them, but guards against float drift / degenerate structures).
+  layers.forEach(layer=>{
+    const reals=layer.filter(id=>!isDummy(id)).sort((a,b)=>x.get(a)-x.get(b));
+    for(let i=1;i<reals.length;i++){
+      const minX=x.get(reals[i-1])+SEP;
+      if(x.get(reals[i])<minX) x.set(reals[i],minX);
+    }
+  });
 
   // normalise to ≥0 and build position records.
   // Row→Y adds REGION_GAP each time we cross into a new status band, so the
@@ -502,7 +571,7 @@ function assignCoords(layers, augLinks, regionInfo) {
     layer.forEach(id=>{
       const px=x.get(id)-minX;
       pos.set(id,{x:px,y:py,cx:px+NW/2,cy:py+NH/2,bx:px+NW/2,by:py+NH,tx:px+NW/2,ty:py});
-      if(px+NW>maxRight) maxRight=px+NW;
+      if(!isDummy(id) && px+NW>maxRight) maxRight=px+NW;   // dummies carry no card width
     });
   });
   const PAD=48;
@@ -527,25 +596,24 @@ function assignCoords(layers, augLinks, regionInfo) {
   return {pos,W,H,bands};
 }
 
-// 5b. Wrap wide tiers so the drawing fits the viewport width. A tier wider than
-// maxCols is split into stacked sub-rows. This is safe: longest-path ranking is
-// proper, so nodes in the same tier never have a block edge between them —
-// stacking them creates no sideways/upward edge. Returns new layers + remapped
-// region offsets. ("Exact tiering is no longer required.")
-function wrapLayers(layers, regionInfo, maxCols) {
-  const {offset, regionTiers}=regionInfo;
-  const origRegion = ri => ri<offset[1]?0 : ri<offset[2]?1 : 2;
-  const newLayers=[], newTiers=[0,0,0];
-  layers.forEach((row,ri)=>{
-    const rg=origRegion(ri);
-    if (row.length<=maxCols || maxCols<1) {
-      newLayers.push(row); newTiers[rg]++;
-    } else {
-      for (let i=0;i<row.length;i+=maxCols){ newLayers.push(row.slice(i,i+maxCols)); newTiers[rg]++; }
-    }
+// 5c. Backbone = spanning forest: each node keeps its closest-above prerequisite
+// (largest pred rank) as its primary edge; all other block edges are secondary.
+// Drives both styling (solid spine vs faded extras) and vertical alignment, so
+// the result reads like a tech tree. Returns a Set of "source|target" keys.
+function computeBackbone(nodes, links, rank) {
+  const byTgt=new Map();
+  links.filter(l=>l.type==='blocks').forEach(l=>{
+    if((rank.get(l.source)??0) >= (rank.get(l.target)??0)) return;   // must point down
+    if(!byTgt.has(l.target)) byTgt.set(l.target,[]);
+    byTgt.get(l.target).push(l.source);
   });
-  const newOffset=[0, newTiers[0], newTiers[0]+newTiers[1]];
-  return {layers:newLayers, regionInfo:{...regionInfo, regionTiers:newTiers, offset:newOffset}};
+  const bb=new Set();
+  byTgt.forEach((ps,tgt)=>{
+    let best=ps[0];
+    ps.forEach(p=>{ if((rank.get(p)??0)>(rank.get(best)??0)) best=p; });
+    bb.add(best+'|'+tgt);
+  });
+  return bb;
 }
 
 // 6. Reconstruct chains through dummies → list of {id, from, to, wps:[positions]}
@@ -729,32 +797,28 @@ function render(nodes, links, filterText='') {
   const wW=wrap.clientWidth, wH=wrap.clientHeight;
   const regionInfo=regionRank(visNodes, visLinks);
   const rank=regionInfo.rank;
-  const {augNodes,augLinks}=insertDummies(visNodes, visLinks, rank);
+  const backbone=computeBackbone(visNodes, visLinks, rank);
+  const {augNodes,augLinks}=insertDummies(visNodes, visLinks, rank, backbone);
   let layers=buildLayers(augNodes, rank);
   layers=minimizeCrossings(layers, augLinks);
-  // wrap wide tiers to fit the viewport width (cards stay readable; scroll down)
-  const maxCols=Math.max(1, Math.floor((wW-96)/(NW+HGAP)));
-  const wrapped=wrapLayers(layers, regionInfo, maxCols);
-  const {pos,W,H,bands}=assignCoords(wrapped.layers, augLinks, wrapped.regionInfo);
+  const {pos,W,H,bands}=assignCoords(layers, augLinks, regionInfo);
 
-  // SVG — fit width, scroll vertically. No interactive zoom. Wrapping keeps the
-  // graph near viewport width; if Brandes–Köpf alignment still overflows, a mild
-  // one-time fit-scale via viewBox absorbs the residue (cards stay readable).
-  const fitScale=W>wW ? wW/W : 1;
-  const svgW=W>wW ? wW : Math.max(W,wW);
-  const svgH=H*fitScale;
-  const offX=W<wW ? (wW-W)/2 : 0;   // centre a narrow graph horizontally
-  svgSel=d3.select(svgEl).attr('width',svgW).attr('height',svgH);
-  if (W>wW) svgSel.attr('viewBox',`0 0 ${W} ${H}`).attr('preserveAspectRatio','xMidYMin meet');
-  else svgSel.attr('viewBox',null);
+  // SVG — natural tech-tree columns at full card size; pan both axes (#gw
+  // scrolls). No wrapping, no zoom: a wide tree scrolls horizontally like a game
+  // skill tree. Centre only when the tree is narrower than the viewport.
+  const svgW=Math.max(W,wW);
+  const offX=W<wW ? (wW-W)/2 : 0;
+  svgSel=d3.select(svgEl).attr('width',svgW).attr('height',H).attr('viewBox',null);
 
   const defs=svgSel.append('defs');
-  [['ab','#E24B4A',8],['ar','#888780',6]].forEach(([id,col,rx])=>{
+  // ab = backbone arrowhead, abf = faded secondary arrowhead, ar = related
+  [['ab','#E24B4A',8,0.85],['abf','#E24B4A',8,0.4],['ar','#888780',6,0.5]].forEach(([id,col,rx,op])=>{
     defs.append('marker').attr('id',id).attr('viewBox','0 0 10 10')
       .attr('refX',rx).attr('refY',5).attr('markerWidth',5).attr('markerHeight',5)
       .attr('orient','auto-start-reverse')
       .append('path').attr('d','M2 1L8 5L2 9').attr('fill','none')
-      .attr('stroke',col).attr('stroke-width',1.5).attr('stroke-linecap','round').attr('stroke-linejoin','round');
+      .attr('stroke',col).attr('stroke-width',1.5).attr('stroke-opacity',op)
+      .attr('stroke-linecap','round').attr('stroke-linejoin','round');
   });
 
   gSel=svgSel.append('g').attr('transform',`translate(${offX},0)`);
@@ -792,15 +856,25 @@ function render(nodes, links, filterText='') {
       .attr('marker-end','url(#ar)');
   });
 
+  // `backbone` (the solid spine: one primary prerequisite per node) was computed
+  // up top and used for alignment; here it just drives edge styling. Secondary
+  // edges (faded) are the extra prerequisites / long links / backward edges.
+  const BB_OP=0.85, SEC_OP=0.22;   // default opacities for backbone / secondary
+
   // Blocks edges — orthogonal, with distributed ports + lanes
   const blockEdges=gSel.append('g').attr('class','block-edges');
   const chains=routeChains(buildChains(augLinks, pos), pos);
+  // draw secondary first so the backbone spine sits on top
+  chains.sort((a,b)=>(backbone.has(a.from+'|'+a.to)?1:0)-(backbone.has(b.from+'|'+b.to)?1:0));
   chains.forEach(c=>{
+    const bb=backbone.has(c.from+'|'+c.to);
     blockEdges.append('path')
       .attr('d',orthoPath(c.pts,R))
-      .attr('data-src',c.from).attr('data-tgt',c.to)
-      .attr('fill','none').attr('stroke','#E24B4A').attr('stroke-width',1.2)
-      .attr('stroke-opacity',0.72).attr('marker-end','url(#ab)');
+      .attr('data-src',c.from).attr('data-tgt',c.to).attr('data-bb',bb?'1':'0')
+      .attr('fill','none').attr('stroke','#E24B4A')
+      .attr('stroke-width',bb?1.6:0.9)
+      .attr('stroke-opacity',bb?BB_OP:SEC_OP)
+      .attr('marker-end',bb?'url(#ab)':'url(#abf)');
   });
 
   // Adjacency over block links (for transitive upstream/downstream highlight)
@@ -831,7 +905,9 @@ function render(nodes, links, filterText='') {
   }
   function clearHighlight(){
     nodeG.selectAll('g[data-node]').attr('opacity',1);
-    blockEdges.selectAll('path').attr('stroke-opacity',0.72);
+    blockEdges.selectAll('path').attr('stroke-opacity',function(){
+      return this.getAttribute('data-bb')==='1'?BB_OP:SEC_OP;
+    });
     relEdges.selectAll('path').attr('stroke-opacity',0.4);
   }
 
