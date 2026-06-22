@@ -121,22 +121,6 @@ function stateColor(t) {
   return '#888780';
 }
 
-// Status → region. 0=Done (top), 1=In Progress (middle), 2=Todo (bottom).
-// The timeline reads top→bottom as done → now → not-yet, so completing an issue
-// moves it UP into Done. Canceled also lands in Done (dimmed) so abandoned work
-// drifts up into the past rather than lingering in the Todo backlog.
-const REGIONS=[
-  {key:'done',  label:'Done',        color:'#1D9E75'},
-  {key:'prog',  label:'In Progress', color:'#378ADD'},
-  {key:'todo',  label:'Todo',        color:'#888780'},
-];
-function regionOf(stateType) {
-  const s=(stateType||'').toLowerCase();
-  if (s==='completed') return 0;
-  if (s==='canceled'||s==='cancelled') return 0;  // drift into the past
-  if (s==='started')   return 1;
-  return 2;  // backlog, unstarted, triage → Todo
-}
 function setStatus(m, err=false) {
   document.getElementById('st').textContent = m;
   document.getElementById('sb').className = 'sb'+(err?' err':'');
@@ -234,34 +218,6 @@ function compactLayers(nodes, links, rank) {
   return rank;
 }
 
-// 1c. Region-aware ranking. Replaces the single global layering: status hard-
-// assigns each node to a region (Done/InProgress/Todo), we layer WITHIN each
-// region using only intra-region block edges, then stack the regions so global
-// rank = (rows used by earlier regions) + intra-region rank. Cross-region edges
-// don't influence ranking — forward ones (Done→…→Todo) point down naturally
-// because regions are stacked in that order; backward ones (pathological) are
-// just drawn as-is and never perturb the normal intra-region layout.
-function regionRank(nodes, links) {
-  const regionTiers=[0,0,0];
-  const rank=new Map();
-  const nodeRegion=new Map(nodes.map(n=>[n.id, regionOf(n.stateType)]));
-  for (let rg=0; rg<3; rg++) {
-    const members=nodes.filter(n=>nodeRegion.get(n.id)===rg);
-    if (!members.length) continue;
-    const ids=new Set(members.map(n=>n.id));
-    // only edges with BOTH endpoints in this region drive intra-region depth
-    const intra=links.filter(l=>l.type==='blocks'&&ids.has(l.source)&&ids.has(l.target));
-    let local=assignLayers(members, intra);
-    local=compactLayers(members, intra, local);
-    let maxLocal=0; members.forEach(n=>{ maxLocal=Math.max(maxLocal, local.get(n.id)); });
-    regionTiers[rg]=maxLocal+1;
-    members.forEach(n=>rank.set(n.id, local.get(n.id)));   // local rank, offset below
-  }
-  // offset each region by the cumulative tiers of the regions above it
-  const offset=[0, regionTiers[0], regionTiers[0]+regionTiers[1]];
-  nodes.forEach(n=>{ const rg=nodeRegion.get(n.id); rank.set(n.id, offset[rg]+(rank.get(n.id)??0)); });
-  return {rank, regionTiers, offset, nodeRegion};
-}
 
 // 2. Dummy node insertion for edges spanning >1 layer. Each augmented link is
 // tagged `bb` (is it part of a backbone edge?) so the dummy chain of a backbone
@@ -445,9 +401,8 @@ function minimizeCrossings(layers, augLinks) {
 //   2. Assign each block one x (the column), then compact layers left-to-right
 //      keeping ≥ (NW+HGAP) between neighbours in a layer and pulling blocks
 //      toward their desired aligned x.
-function assignCoords(layers, augLinks, regionInfo) {
+function assignCoords(layers, augLinks) {
   const SEP=NW+HGAP;
-  const REGION_GAP=0;    // no extra space between bands — backgrounds tile fully
   const idLayer=new Map(), idIdx=new Map();
   layers.forEach((layer,ri)=>layer.forEach((id,ci)=>{ idLayer.set(id,ri); idIdx.set(id,ci); }));
 
@@ -551,20 +506,12 @@ function assignCoords(layers, augLinks, regionInfo) {
     }
   });
 
-  // normalise to ≥0 and build position records.
-  // Row→Y adds REGION_GAP each time we cross into a new status band, so the
-  // three regions are visually separated. regionInfo.offset = first row of
-  // [Done, InProgress, Todo]; a region with 0 tiers contributes no gap.
+  // normalise to ≥0 and build position records. Y is driven purely by
+  // dependency rank (one row per tier), so a node's position is stable as its
+  // status changes — only a change in the relationships moves it.
   let minX=Infinity;
   x.forEach(v=>{ if(v<minX) minX=v; });
-  const offset=regionInfo?.offset||[0,0,0];
-  const tiers=regionInfo?.regionTiers||[0,0,0];
-  const LABEL_H=26;   // headroom above the topmost row for the band label
-  // rowRegion(ri): which region row ri sits in
-  const rowRegion=ri=> ri<offset[1]?0 : ri<offset[2]?1 : 2;
-  // how many band-gaps precede region rg (only count non-empty earlier bands)
-  const gapsBefore=rg=>{ let g=0; for(let r=0;r<rg;r++) if(tiers[r]>0) g++; return g; };
-  const rowY=ri=> LABEL_H + ri*(NH+VGAP) + gapsBefore(rowRegion(ri))*REGION_GAP;
+  const rowY=ri=> ri*(NH+VGAP);
 
   let maxRight=0;
   layers.forEach((layer,ri)=>{
@@ -580,21 +527,7 @@ function assignCoords(layers, augLinks, regionInfo) {
   const W=maxRight+PAD*2;
   pos.forEach(p=>{ p.x+=PAD; p.cx+=PAD; p.bx+=PAD; p.tx+=PAD; p.y+=PAD; p.cy+=PAD; p.by+=PAD; p.ty+=PAD; });
 
-  // Region bands tile the full background with no gaps. Each boundary sits
-  // midway in the vertical space between one region's last card and the next's
-  // first card; the top band starts at 0 and the bottom band ends at H. Adjacent
-  // bands compute the shared boundary identically, so they meet exactly.
-  const present=[];
-  for(let rg=0; rg<3; rg++) if(tiers[rg]>0) present.push(rg);
-  const cardTop=row=>rowY(row)+PAD, cardBot=row=>rowY(row)+PAD+NH;
-  const boundary=(upperRg,lowerRg)=>
-    (cardBot(offset[upperRg]+tiers[upperRg]-1)+cardTop(offset[lowerRg]))/2;
-  const bands=present.map((rg,i)=>({
-    region:rg,
-    top: i===0 ? 0 : boundary(present[i-1], rg),
-    bot: i===present.length-1 ? H : boundary(rg, present[i+1]),
-  }));
-  return {pos,W,H,bands};
+  return {pos,W,H};
 }
 
 // 5c. Backbone = spanning forest: each node keeps its closest-above prerequisite
@@ -871,15 +804,16 @@ function render(nodes, links, filterText='') {
   }
   svgEl.style.display='block'; emptyEl.style.display='none';
 
-  // Pipeline — rank by status region (Done/InProgress/Todo), depth within each
+  // Pipeline — rank purely by dependency depth (no status banding), so nodes
+  // keep their position as their status changes; only relationship changes move them.
   const wW=wrap.clientWidth, wH=wrap.clientHeight;
-  const regionInfo=regionRank(visNodes, visLinks);
-  const rank=regionInfo.rank;
+  let rank=assignLayers(visNodes, visLinks);
+  rank=compactLayers(visNodes, visLinks, rank);
   const backbone=computeBackbone(visNodes, visLinks, rank);
   const {augNodes,augLinks}=insertDummies(visNodes, visLinks, rank, backbone);
   let layers=buildLayers(augNodes, rank);
   layers=minimizeCrossings(layers, augLinks);
-  const {pos,W,H,bands}=assignCoords(layers, augLinks, regionInfo);
+  const {pos,W,H}=assignCoords(layers, augLinks);
 
   // SVG — natural tech-tree columns at full card size; pan both axes (#gw
   // scrolls). No wrapping, no zoom: a wide tree scrolls horizontally like a game
@@ -900,23 +834,6 @@ function render(nodes, links, filterText='') {
   });
 
   gSel=svgSel.append('g').attr('transform',`translate(${offX},0)`);
-
-  // Status-region bands — full-width tinted rectangles behind everything.
-  // When scaling (W>wW) content 0..W maps to the full width; otherwise gSel is
-  // shifted by offX, so start at -offX and span the viewport width.
-  const bandG=gSel.append('g').attr('class','bands');
-  const bandW=W>wW ? W : Math.max(W,wW);
-  bands.forEach(b=>{
-    const r=REGIONS[b.region];
-    bandG.append('rect')
-      .attr('x',-offX).attr('y',b.top).attr('width',bandW).attr('height',b.bot-b.top)
-      .attr('fill',r.color).attr('fill-opacity',0.06);
-    bandG.append('text')
-      .attr('x',-offX+16).attr('y',b.top+20)
-      .attr('font-size',12).attr('font-weight',600).attr('font-family','var(--font)')
-      .attr('fill',r.color).attr('fill-opacity',0.85).attr('letter-spacing','0.04em')
-      .text(r.label.toUpperCase());
-  });
 
   // Related edges — simple curved arcs, behind everything
   const relEdges=gSel.append('g').attr('class','rel-edges');
