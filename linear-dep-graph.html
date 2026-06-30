@@ -967,11 +967,11 @@ function render(nodes, links, filterText='') {
       .on('click',()=>window.open(`https://linear.app/${WORKSPACE}/issue/${n.identifier}`,'_blank'));
 
     // Card background. The border STYLE encodes readiness (orthogonal to the
-    // status colour): bold solid = unblocked (the frontier pops), dashed = only
-    // blocked by review work (stackable), faint = blocked. Done/cancelled keep a
-    // plain border; external stays faint.
+    // status colour): dashed = only blocked by review work (stackable), faint =
+    // blocked, plain solid = unblocked / done / cancelled. The left accent bar
+    // tracks the same opacity so it dims with the border. External stays faint.
     const bs = {
-      unblocked:{w:2,   o:1,    d:null },
+      unblocked:{w:1,   o:0.8,  d:null },
       review:   {w:1.5, o:0.95, d:'4 3'},
       blocked:  {w:1,   o:0.28, d:null },
       none:     {w:1,   o:0.8,  d:null },
@@ -982,9 +982,9 @@ function render(nodes, links, filterText='') {
       .attr('stroke',col).attr('stroke-width',bs.w).attr('stroke-opacity',bs.o)
       .attr('stroke-dasharray',bs.d);
 
-    // Left accent bar
+    // Left accent bar — opacity matches the border (readiness-driven).
     g.append('rect').attr('x',0).attr('y',5).attr('width',3).attr('height',NH-10).attr('rx',1.5)
-      .attr('fill',col).attr('fill-opacity',ext?0.35:0.9);
+      .attr('fill',col).attr('fill-opacity',bs.o);
 
     // Identifier label
     g.append('text').attr('x',11).attr('y',16)
