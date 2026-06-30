@@ -1024,12 +1024,14 @@ function render(nodes, links, filterText='') {
       .attr('fill','var(--text)').attr('fill-opacity',ext?0.4:0.85);
     wrapTitleTwoLines(titleEl, n.title, 11, [28,39], NW-19);
 
-    // "Start this issue" launcher — only on startable cards (unblocked or
-    // only-review-blocked). Opens a Claude Code web session prefilled with
-    // "/start-issue <ID>" and the configured repos. Opaque backing keeps it
-    // legible over the title; stopPropagation so it doesn't trigger the
-    // card's open-in-Linear click.
-    if ((rd==='unblocked' || rd==='review') && !ext) {
+    // "Start this issue" launcher — only on not-yet-started, startable cards
+    // (unblocked or only-review-blocked). Issues already being worked (In
+    // Progress / In Review, both the `started` type) don't need a start link.
+    // Opens a Claude Code web session prefilled with "/start-issue <ID>" and the
+    // configured repos. Opaque backing keeps it legible over the title;
+    // stopPropagation so it doesn't trigger the card's open-in-Linear click.
+    const startedSelf=(n.stateType||'').toLowerCase()==='started';
+    if ((rd==='unblocked' || rd==='review') && !ext && !startedSelf) {
       const bw=18, bh=13, bx=NW-3-bw, by=NH-3-bh;
       const chip=g.append('g').style('cursor','pointer')
         .on('click',(e)=>{ e.stopPropagation(); window.open(startUrl(n.identifier),'_blank'); });
