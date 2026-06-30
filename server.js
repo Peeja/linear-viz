@@ -1,12 +1,12 @@
 // Zero-dependency local server for the Linear dependency graph.
 //
-// - Reads the Linear API key from config.json (never sent to the browser).
+// - Reads the Linear API key from config.jsonc (never sent to the browser).
 // - Serves linear-dep-graph.html at /
 // - Proxies POST /api/graphql to Linear, injecting the key server-side.
 // - Exposes GET /api/meta so the page knows the workspace slug for issue links.
 //
 // Run:  node server.js
-// Config: copy config.example.json -> config.json and set linearApiKey.
+// Config: copy config.example.jsonc -> config.jsonc and set linearApiKey.
 
 const http = require('http');
 const fs = require('fs');
@@ -14,7 +14,9 @@ const path = require('path');
 const https = require('https');
 
 const ROOT = __dirname;
-const CONFIG_PATH = path.join(ROOT, 'config.json');
+// Prefer config.jsonc (so editors treat comments as valid); fall back to
+// config.json for existing setups.
+const CONFIG_PATHS = ['config.jsonc', 'config.json'].map(f => path.join(ROOT, f));
 const HTML_PATH = path.join(ROOT, 'linear-dep-graph.html');
 const LINEAR_GQL = 'https://api.linear.app/graphql';
 
@@ -61,22 +63,28 @@ function stripTrailingCommas(s) {
 }
 
 function loadConfig() {
+  const found = CONFIG_PATHS.find(p => fs.existsSync(p));
+  if (!found) {
+    console.error(`\nNo config.jsonc found.\nCopy config.example.jsonc to config.jsonc and set your Linear API key.\n`);
+    process.exit(1);
+  }
+  const name = path.basename(found);
   let raw;
   try {
-    raw = fs.readFileSync(CONFIG_PATH, 'utf8');
+    raw = fs.readFileSync(found, 'utf8');
   } catch {
-    console.error(`\nNo config.json found.\nCopy config.example.json to config.json and set your Linear API key.\n`);
+    console.error(`\nCould not read ${name}.\n`);
     process.exit(1);
   }
   let cfg;
   try {
     cfg = JSON.parse(stripTrailingCommas(stripJsonComments(raw)));
   } catch (e) {
-    console.error(`\nconfig.json is not valid JSON (comments and trailing commas are allowed): ${e.message}\n`);
+    console.error(`\n${name} is not valid JSON (comments and trailing commas are allowed): ${e.message}\n`);
     process.exit(1);
   }
   if (!cfg.linearApiKey || cfg.linearApiKey === 'YOUR_API_KEY_HERE') {
-    console.error(`\nSet "linearApiKey" in config.json (currently a placeholder).\nGet one at https://linear.app/settings/api\n`);
+    console.error(`\nSet "linearApiKey" in ${name} (currently a placeholder).\nGet one at https://linear.app/settings/api\n`);
     process.exit(1);
   }
   return cfg;
