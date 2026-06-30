@@ -90,6 +90,9 @@ button:disabled { opacity:0.4; cursor:default; transform:none; }
     <div class="li"><div class="dot" style="background:var(--c-review)"></div>In review</div>
     <div class="li"><div class="dot" style="background:var(--c-todo)"></div>Todo/backlog</div>
     <div class="li"><div class="dot" style="background:var(--c-cancelled)"></div>Cancelled</div>
+    <div class="li" style="margin-left:4px"><svg width="17" height="11"><rect x="1" y="1" width="15" height="9" rx="2" fill="none" stroke="var(--text2)" stroke-width="2"/></svg>Unblocked</div>
+    <div class="li"><svg width="17" height="11"><rect x="1" y="1" width="15" height="9" rx="2" fill="none" stroke="var(--text2)" stroke-width="1.3" stroke-dasharray="3 2"/></svg>Review-blocked</div>
+    <div class="li"><svg width="17" height="11"><rect x="1" y="1" width="15" height="9" rx="2" fill="none" stroke="var(--text2)" stroke-opacity="0.35"/></svg>Blocked</div>
     <div class="li" style="margin-left:4px">
       <svg width="22" height="10"><line x1="0" y1="5" x2="22" y2="5" stroke="var(--c-block)" stroke-width="1.5"/></svg>Blocks
     </div>
@@ -113,11 +116,16 @@ let WORKSPACE = 'filecoin-foundation';  // overwritten from /api/meta
 
 const isDummy = id => typeof id === 'string' && id.startsWith('__d_');
 
+// Workflow-state predicates (shared by colouring and readiness). "In Review" is
+// a started-type state distinguished by name (gated so a completed "Reviewed"
+// state isn't mistaken for it).
+function isReview(type, name){ return (type||'').toLowerCase()==='started' && !!name && /review/i.test(name); }
+function isDone(type){ return (type||'').toLowerCase()==='completed'; }
+function isCancelled(type){ const s=(type||'').toLowerCase(); return s==='canceled'||s==='cancelled'; }
+
 function stateColor(t, name) {
+  if (isReview(t, name)) return '#8E76E5';
   const s = (t||'').toLowerCase();
-  // "In Review" is a started-type state distinguished by name; give it its own
-  // colour. (Gated to started so a completed "Reviewed" state stays green.)
-  if (s==='started' && name && /review/i.test(name)) return '#8E76E5';
   if (s==='completed') return '#1D9E75';
   if (s==='started')   return '#378ADD';
   if (s==='canceled'||s==='cancelled') return '#D85A30';
@@ -909,11 +917,27 @@ function render(nodes, links, filterText='') {
     relEdges.selectAll('path').attr('stroke-opacity',0.4);
   }
 
+  // Readiness (orthogonal to status): is each issue blocked, unblocked, or only
+  // blocked by In-Review work (startable as a stacked PR)? Computed over the FULL
+  // graph (not the filtered view) so a hidden blocker can't make a node look ready.
+  const allById=new Map(nodes.map(n=>[n.id,n]));
+  const blockersOf=new Map(nodes.map(n=>[n.id,[]]));
+  links.filter(l=>l.type==='blocks').forEach(l=>{ if(blockersOf.has(l.target)) blockersOf.get(l.target).push(l.source); });
+  function readinessOf(n){
+    if(isDone(n.stateType)||isCancelled(n.stateType)) return 'none';   // finished — no mark
+    const open=(blockersOf.get(n.id)||[]).map(id=>allById.get(id)).filter(Boolean)
+      .filter(b=>!isDone(b.stateType)&&!isCancelled(b.stateType));     // still-pending blockers
+    if(!open.length) return 'unblocked';
+    if(open.every(b=>isReview(b.stateType,b.stateName))) return 'review';  // stackable PRs
+    return 'blocked';
+  }
+
   // Nodes
   const nodeG=gSel.append('g').attr('class','nodes');
   visNodes.forEach(n=>{
     const p=pos.get(n.id); if(!p) return;
     const col=stateColor(n.stateType, n.stateName), ext=n.external;
+    const rd = ext ? 'ext' : readinessOf(n);
     const g=nodeG.append('g').attr('data-node',n.id).attr('transform',`translate(${p.x},${p.y})`).style('cursor','pointer')
       .on('mouseover', ()=>{
         highlight(n.id);
@@ -925,6 +949,8 @@ function render(nodes, links, filterText='') {
         if (n.stateName) h+=`<br><span style="opacity:0.6">${n.stateName}</span>`;
         const who=assigneeName(n);
         if (who) h+=`<br><span style="opacity:0.6">${who}</span>`;
+        const rdLabel={unblocked:'Unblocked — ready to start',review:'Startable — blockers in review',blocked:'Blocked'}[rd];
+        if (rdLabel) h+=`<br><span style="opacity:0.7">${rdLabel}</span>`;
         if (bMe.length) h+=`<br><span style="color:var(--c-block)">Blocked by: ${bMe.join(', ')}</span>`;
         if (iBlk.length) h+=`<br><span style="color:var(--c-block)">Blocks: ${iBlk.join(', ')}</span>`;
         if (ext) h+=`<br><span style="opacity:0.45"><em>External</em></span>`;
@@ -940,10 +966,21 @@ function render(nodes, links, filterText='') {
       .on('mouseout',()=>{ tooltip.style.display='none'; clearHighlight(); })
       .on('click',()=>window.open(`https://linear.app/${WORKSPACE}/issue/${n.identifier}`,'_blank'));
 
-    // Card background
+    // Card background. The border STYLE encodes readiness (orthogonal to the
+    // status colour): bold solid = unblocked (the frontier pops), dashed = only
+    // blocked by review work (stackable), faint = blocked. Done/cancelled keep a
+    // plain border; external stays faint.
+    const bs = {
+      unblocked:{w:2,   o:1,    d:null },
+      review:   {w:1.5, o:0.95, d:'4 3'},
+      blocked:  {w:1,   o:0.28, d:null },
+      none:     {w:1,   o:0.8,  d:null },
+      ext:      {w:0.5, o:0.4,  d:null },
+    }[rd];
     g.append('rect').attr('width',NW).attr('height',NH).attr('rx',6)
       .attr('fill',col).attr('fill-opacity',ext?0.07:0.10)
-      .attr('stroke',col).attr('stroke-width',ext?0.5:1).attr('stroke-opacity',ext?0.4:0.8);
+      .attr('stroke',col).attr('stroke-width',bs.w).attr('stroke-opacity',bs.o)
+      .attr('stroke-dasharray',bs.d);
 
     // Left accent bar
     g.append('rect').attr('x',0).attr('y',5).attr('width',3).attr('height',NH-10).attr('rx',1.5)
