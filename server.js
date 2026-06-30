@@ -87,7 +87,17 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && pathname === '/api/meta') {
-    send(res, 200, 'application/json', JSON.stringify({ workspace: cfg.workspace || 'filecoin-foundation' }));
+    // Repos to attach to a "start this issue" Claude Code session. The skill
+    // repo (where /start-issue lives) is always included, even if omitted from
+    // startRepos. Repos must be accessible to the user's connected GitHub account.
+    const skillRepo = cfg.skillRepo || 'Peeja/ff-claude';
+    const startRepos = Array.isArray(cfg.startRepos) ? cfg.startRepos.slice() : [];
+    if (!startRepos.includes(skillRepo)) startRepos.push(skillRepo);
+    send(res, 200, 'application/json', JSON.stringify({
+      workspace: cfg.workspace || 'filecoin-foundation',
+      startRepos,
+      startEnvironment: cfg.startEnvironment || '',
+    }));
     return;
   }
 

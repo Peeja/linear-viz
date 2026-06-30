@@ -1,5 +1,8 @@
 {
   "linearApiKey": "YOUR_API_KEY_HERE",
   "workspace": "filecoin-foundation",
-  "port": 8787
+  "port": 8787,
+  "startRepos": ["fil-forge/your-repo"],
+  "skillRepo": "Peeja/ff-claude",
+  "startEnvironment": ""
 }

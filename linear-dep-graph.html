@@ -113,6 +113,17 @@ const GQL = '/api/graphql';  // local proxy; key is injected server-side
 const NW = 172, NH = 44, HGAP = 40, VGAP = 88, R = 6;
 let allNodes=[], allLinks=[], svgSel, gSel;
 let WORKSPACE = 'filecoin-foundation';  // overwritten from /api/meta
+let START_REPOS = [];   // owner/repo slugs to attach to a start session (incl. skill repo)
+let START_ENV = '';     // optional cloud environment name/id
+// Deep-link that opens a Claude Code web session prefilled to start this issue.
+// Encode with encodeURIComponent (spaces → %20, per the docs' examples) rather
+// than URLSearchParams (which uses +) so the prompt arrives intact.
+function startUrl(identifier){
+  const parts=['prompt='+encodeURIComponent(`/start-issue ${identifier}`)];
+  if (START_REPOS.length) parts.push('repositories='+encodeURIComponent(START_REPOS.join(',')));
+  if (START_ENV) parts.push('environment='+encodeURIComponent(START_ENV));
+  return 'https://claude.ai/code?'+parts.join('&');
+}
 
 const isDummy = id => typeof id === 'string' && id.startsWith('__d_');
 
@@ -1012,6 +1023,23 @@ function render(nodes, links, filterText='') {
       .attr('font-size',11).attr('font-family','var(--font)')
       .attr('fill','var(--text)').attr('fill-opacity',ext?0.4:0.85);
     wrapTitleTwoLines(titleEl, n.title, 11, [28,39], NW-19);
+
+    // "Start this issue" launcher — only on startable cards (unblocked or
+    // only-review-blocked). Opens a Claude Code web session prefilled with
+    // "/start-issue <ID>" and the configured repos. Opaque backing keeps it
+    // legible over the title; stopPropagation so it doesn't trigger the
+    // card's open-in-Linear click.
+    if ((rd==='unblocked' || rd==='review') && !ext) {
+      const bw=18, bh=13, bx=NW-3-bw, by=NH-3-bh;
+      const chip=g.append('g').style('cursor','pointer')
+        .on('click',(e)=>{ e.stopPropagation(); window.open(startUrl(n.identifier),'_blank'); });
+      chip.append('title').text(`Start a Claude Code session — /start-issue ${n.identifier}`);
+      chip.append('rect').attr('x',bx).attr('y',by).attr('width',bw).attr('height',bh).attr('rx',3)
+        .attr('fill','var(--bg2)').attr('stroke',col).attr('stroke-opacity',0.55).attr('stroke-width',0.75);
+      chip.append('text').attr('x',bx+bw/2+0.5).attr('y',by+bh/2+3).attr('text-anchor','middle')
+        .attr('font-size',8).attr('fill',col).attr('fill-opacity',0.9).style('pointer-events','none')
+        .text('▶');
+    }
   });
 
   // Graph is sized to fit width and centred (gSel transform set above); the
@@ -1054,7 +1082,11 @@ document.getElementById('pi').addEventListener('keydown',e=>{
 window.addEventListener('resize', ()=>{ if(allNodes.length) render(allNodes,allLinks,document.getElementById('fi').value); });
 
 // Pick up the workspace slug (for click-to-open links) from the server config.
-fetch('/api/meta').then(r=>r.json()).then(m=>{ if(m.workspace) WORKSPACE=m.workspace; }).catch(()=>{});
+fetch('/api/meta').then(r=>r.json()).then(m=>{
+  if(m.workspace) WORKSPACE=m.workspace;
+  if(Array.isArray(m.startRepos)) START_REPOS=m.startRepos;
+  if(m.startEnvironment) START_ENV=m.startEnvironment;
+}).catch(()=>{});
 
 // Restore the root issue from the URL (?issue=FIL-273) so a refresh keeps it.
 const initialIssue=new URLSearchParams(location.search).get('issue');
