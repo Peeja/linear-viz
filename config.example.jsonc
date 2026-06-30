@@ -17,5 +17,5 @@
   "skillRepo": "Peeja/ff-claude",
 
   // Optional: pin a Claude Code cloud environment (name or id). Empty = pick in the UI.
-  "startEnvironment": "",
+  "startEnvironment": ""
 }
