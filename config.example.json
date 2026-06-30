@@ -1,8 +1,21 @@
 {
+  // Linear personal API key (linear.app/settings/api).
+  // Kept server-side; never sent to the browser.
   "linearApiKey": "YOUR_API_KEY_HERE",
+
+  // Workspace slug, used for click-to-open Linear links.
   "workspace": "filecoin-foundation",
+
+  // Port for the local server.
   "port": 8787,
+
+  // Repos attached to a "start this issue" Claude Code session (owner/repo).
+  // Must be accessible to your connected GitHub account.
   "startRepos": ["fil-forge/your-repo"],
+
+  // Repo where the /start-issue skill lives; always included automatically.
   "skillRepo": "Peeja/ff-claude",
-  "startEnvironment": ""
+
+  // Optional: pin a Claude Code cloud environment (name or id). Empty = pick in the UI.
+  "startEnvironment": "",
 }

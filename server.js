@@ -18,6 +18,48 @@ const CONFIG_PATH = path.join(ROOT, 'config.json');
 const HTML_PATH = path.join(ROOT, 'linear-dep-graph.html');
 const LINEAR_GQL = 'https://api.linear.app/graphql';
 
+// Allow JSONC in config.json: // line and /* */ block comments, plus trailing
+// commas. Both passes are string-aware, so comment markers or commas inside a
+// quoted value (e.g. a URL containing "//") are left untouched.
+function stripJsonComments(s) {
+  let out = '', inStr = false, inLine = false, inBlock = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i], n = s[i + 1];
+    if (inLine) { if (c === '\n') { inLine = false; out += c; } continue; }
+    if (inBlock) { if (c === '*' && n === '/') { inBlock = false; i++; } continue; }
+    if (inStr) {
+      out += c;
+      if (c === '\\') { out += (n ?? ''); i++; }   // keep the escaped char verbatim
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; out += c; continue; }
+    if (c === '/' && n === '/') { inLine = true; i++; continue; }
+    if (c === '/' && n === '*') { inBlock = true; i++; continue; }
+    out += c;
+  }
+  return out;
+}
+function stripTrailingCommas(s) {
+  let out = '', inStr = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      out += c;
+      if (c === '\\') { out += (s[i + 1] ?? ''); i++; }
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; out += c; continue; }
+    if (c === ',') {
+      let j = i + 1; while (j < s.length && /\s/.test(s[j])) j++;
+      if (s[j] === '}' || s[j] === ']') continue;   // drop comma before a closer
+    }
+    out += c;
+  }
+  return out;
+}
+
 function loadConfig() {
   let raw;
   try {
@@ -28,9 +70,9 @@ function loadConfig() {
   }
   let cfg;
   try {
-    cfg = JSON.parse(raw);
+    cfg = JSON.parse(stripTrailingCommas(stripJsonComments(raw)));
   } catch (e) {
-    console.error(`\nconfig.json is not valid JSON: ${e.message}\n`);
+    console.error(`\nconfig.json is not valid JSON (comments and trailing commas are allowed): ${e.message}\n`);
     process.exit(1);
   }
   if (!cfg.linearApiKey || cfg.linearApiKey === 'YOUR_API_KEY_HERE') {
