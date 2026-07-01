@@ -1103,6 +1103,10 @@ document.getElementById('pi').addEventListener('keydown',e=>{
 });
 window.addEventListener('resize', ()=>{ if(allNodes.length) render(allNodes,allLinks,document.getElementById('fi').value); });
 
+// Dev live-reload: refresh the page when the served HTML changes on disk
+// (e.g. a git pull lands). Harmless if the endpoint isn't available.
+try { new EventSource('/api/reload').onmessage = ()=>location.reload(); } catch {}
+
 // Pick up the workspace slug (for click-to-open links) from the server config.
 fetch('/api/meta').then(r=>r.json()).then(m=>{
   if(m.workspace) WORKSPACE=m.workspace;

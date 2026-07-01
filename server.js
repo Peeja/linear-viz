@@ -123,6 +123,18 @@ function send(res, status, type, body) {
   res.end(body);
 }
 
+// ── Live reload (dev) ──────────────────────────────────────────────────────
+// The page opens an SSE stream at /api/reload; when the served HTML changes on
+// disk (e.g. a `git pull` lands new work), we push a "reload" and the browser
+// refreshes itself — no manual reload. watchFile (polling) is used because it
+// survives the file being replaced wholesale, which git often does.
+const reloadClients = new Set();
+fs.watchFile(HTML_PATH, { interval: 400 }, (cur, prev) => {
+  if (cur.mtimeMs && cur.mtimeMs !== prev.mtimeMs) {
+    for (const c of reloadClients) { try { c.write('data: reload\n\n'); } catch {} }
+  }
+});
+
 const server = http.createServer(async (req, res) => {
   // Match on the pathname only — the page puts the root issue in the query
   // string (/?issue=FIL-273), which must not defeat the route match.
@@ -148,6 +160,14 @@ const server = http.createServer(async (req, res) => {
       startRepos,
       startEnvironment: cfg.startEnvironment || '',
     }));
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/api/reload') {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+    res.write('retry: 1000\n\n');
+    reloadClients.add(res);
+    req.on('close', () => reloadClients.delete(res));
     return;
   }
 
