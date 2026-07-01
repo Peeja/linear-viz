@@ -124,6 +124,19 @@ function startUrl(identifier){
   if (START_ENV) parts.push('environment='+encodeURIComponent(START_ENV));
   return 'https://claude.ai/code?'+parts.join('&');
 }
+// Small chip in a card's bottom-right (opaque backing keeps it legible over the
+// title; stopPropagation so it doesn't trigger the card's open-in-Linear click).
+function drawCardChip(g, col, glyph, tip, onClick){
+  const bw=18, bh=13, bx=NW-3-bw, by=NH-3-bh;
+  const chip=g.append('g').style('cursor','pointer')
+    .on('click',(e)=>{ e.stopPropagation(); onClick(); });
+  chip.append('title').text(tip);
+  chip.append('rect').attr('x',bx).attr('y',by).attr('width',bw).attr('height',bh).attr('rx',3)
+    .attr('fill','var(--bg2)').attr('stroke',col).attr('stroke-opacity',0.55).attr('stroke-width',0.75);
+  chip.append('text').attr('x',bx+bw/2+0.5).attr('y',by+bh/2+3).attr('text-anchor','middle')
+    .attr('font-size',8).attr('fill',col).attr('fill-opacity',0.9).style('pointer-events','none')
+    .text(glyph);
+}
 
 const isDummy = id => typeof id === 'string' && id.startsWith('__d_');
 
@@ -160,7 +173,8 @@ async function gqlQ(query, vars={}) {
   return j.data;
 }
 const USER = `assignee{name displayName avatarUrl}`;
-const FRAG = `id identifier title state{type name} ${USER}
+const ATTACH = `attachments(first:25){nodes{url createdAt}}`;
+const FRAG = `id identifier title state{type name} ${USER} ${ATTACH}
   relations(first:50){nodes{type relatedIssue{id identifier title state{type name} ${USER}}}}`;
 async function loadIssues(pid) {
   // issue(id:) accepts both the human identifier (e.g. "FIL-273") and the UUID
@@ -173,10 +187,21 @@ async function loadIssues(pid) {
 }
 
 // ── Graph build ──────────────────────────────────────────────────────────────
+// Newest Claude Code session URL attached to the issue (the /start-issue skill
+// records its own session as a Linear attachment). Matched by URL prefix so it
+// can't collide with PR/Figma/etc. attachments; newest wins if there are several.
+const SESSION_PREFIX = 'https://claude.ai/code';
+function sessionUrlOf(attachments) {
+  const ns = (attachments?.nodes || []).filter(a => a.url && a.url.startsWith(SESSION_PREFIX));
+  if (!ns.length) return null;
+  ns.sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));   // ISO dates sort chronologically
+  return ns[0].url;
+}
 function buildGraph(issues) {
   const nm = new Map();
   issues.forEach(i => nm.set(i.id, {id:i.id,identifier:i.identifier,title:i.title,
-    stateType:i.state?.type, stateName:i.state?.name, assignee:i.assignee||null, external:false}));
+    stateType:i.state?.type, stateName:i.state?.name, assignee:i.assignee||null,
+    sessionUrl:sessionUrlOf(i.attachments), external:false}));
   const links=[], seen=new Set();
   issues.forEach(iss => {
     (iss.relations?.nodes||[]).forEach(rel => {
@@ -1024,23 +1049,18 @@ function render(nodes, links, filterText='') {
       .attr('fill','var(--text)').attr('fill-opacity',ext?0.4:0.85);
     wrapTitleTwoLines(titleEl, n.title, 11, [28,39], NW-19);
 
-    // "Start this issue" launcher — only on not-yet-started, startable cards
-    // (unblocked or only-review-blocked). Issues already being worked (In
-    // Progress / In Review, both the `started` type) don't need a start link.
-    // Opens a Claude Code web session prefilled with "/start-issue <ID>" and the
-    // configured repos. Opaque backing keeps it legible over the title;
-    // stopPropagation so it doesn't trigger the card's open-in-Linear click.
+    // Card launcher. If the issue already has a Claude Code session (recorded by
+    // /start-issue as an attachment), show an "open session" chip (↗). Otherwise,
+    // on not-yet-started startable cards (unblocked or only-review-blocked; not
+    // already In Progress / In Review), show a "start" chip (▶). External nodes
+    // get neither.
     const startedSelf=(n.stateType||'').toLowerCase()==='started';
-    if ((rd==='unblocked' || rd==='review') && !ext && !startedSelf) {
-      const bw=18, bh=13, bx=NW-3-bw, by=NH-3-bh;
-      const chip=g.append('g').style('cursor','pointer')
-        .on('click',(e)=>{ e.stopPropagation(); window.open(startUrl(n.identifier),'_blank'); });
-      chip.append('title').text(`Start a Claude Code session — /start-issue ${n.identifier}`);
-      chip.append('rect').attr('x',bx).attr('y',by).attr('width',bw).attr('height',bh).attr('rx',3)
-        .attr('fill','var(--bg2)').attr('stroke',col).attr('stroke-opacity',0.55).attr('stroke-width',0.75);
-      chip.append('text').attr('x',bx+bw/2+0.5).attr('y',by+bh/2+3).attr('text-anchor','middle')
-        .attr('font-size',8).attr('fill',col).attr('fill-opacity',0.9).style('pointer-events','none')
-        .text('▶');
+    if (n.sessionUrl) {
+      drawCardChip(g, col, '↗', `Open the Claude Code session for ${n.identifier}`,
+        ()=>window.open(n.sessionUrl,'_blank'));
+    } else if ((rd==='unblocked' || rd==='review') && !ext && !startedSelf) {
+      drawCardChip(g, col, '▶', `Start a Claude Code session — /start-issue ${n.identifier}`,
+        ()=>window.open(startUrl(n.identifier),'_blank'));
     }
   });
 
