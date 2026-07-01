@@ -90,9 +90,6 @@ button:disabled { opacity:0.4; cursor:default; transform:none; }
     <div class="li" style="margin-left:4px">
       <svg width="22" height="10"><line x1="0" y1="5" x2="22" y2="5" stroke="var(--c-block)" stroke-width="1.5"/></svg>Blocks
     </div>
-    <div class="li">
-      <svg width="22" height="10"><line x1="0" y1="5" x2="22" y2="5" stroke="var(--c-todo)" stroke-width="1" stroke-dasharray="3 2"/></svg>Related
-    </div>
   </div>
 </div>
 <div id="gw">
@@ -240,8 +237,9 @@ function buildGraph(issues) {
   issues.forEach(iss => {
     (iss.relations?.nodes||[]).forEach(rel => {
       const ri = rel.relatedIssue; if (!ri) return;
-      // Skip blocked_by — it's the mirror of blocks from the other side
-      if (rel.type==='blocked_by') return;
+      // Only "blocks" drives the graph. (blocked_by is its mirror; "related" and
+      // other relation types are intentionally ignored — they were just noise.)
+      if (rel.type!=='blocks') return;
       if (!nm.has(ri.id)) nm.set(ri.id,{id:ri.id,identifier:ri.identifier,title:ri.title,
         stateType:ri.state?.type, stateName:ri.state?.name, assignee:ri.assignee||null, external:true});
       const key=`${iss.id}|${ri.id}|${rel.type}`;
@@ -915,22 +913,6 @@ function render(nodes, links, filterText='') {
 
   gSel=svgSel.append('g').attr('transform',`translate(${offX},0)`);
 
-  // Related edges — simple curved arcs, behind everything
-  const relEdges=gSel.append('g').attr('class','rel-edges');
-  visLinks.filter(l=>l.type==='related').forEach(l=>{
-    const ps=pos.get(l.source), pt=pos.get(l.target); if(!ps||!pt) return;
-    // Arc from right side of source to right side of target, curves outward
-    const x1=ps.x+NW, y1=ps.cy, x2=pt.x+NW, y2=pt.cy;
-    const bulge=Math.abs(y2-y1)*0.5+40;
-    const mx=Math.max(x1,x2)+bulge;
-    relEdges.append('path')
-      .attr('d',`M ${x1} ${y1} C ${mx} ${y1} ${mx} ${y2} ${x2} ${y2}`)
-      .attr('data-src',l.source).attr('data-tgt',l.target).attr('data-related','1')
-      .attr('fill','none').attr('stroke','#888780').attr('stroke-width',0.8)
-      .attr('stroke-dasharray','3 2').attr('stroke-opacity',0.4)
-      .attr('marker-end','url(#ar)');
-  });
-
   // `backbone` (the solid spine: one primary prerequisite per node) was computed
   // up top and used for alignment; here it just drives edge styling. Secondary
   // edges (faded) are the extra prerequisites / long links / backward edges.
@@ -976,14 +958,12 @@ function render(nodes, links, filterText='') {
       const s=this.getAttribute('data-src'), t=this.getAttribute('data-tgt');
       return set.has(s)&&set.has(t)?0.95:0.06;
     });
-    relEdges.selectAll('path').attr('stroke-opacity',0.06);
   }
   function clearHighlight(){
     nodeG.selectAll('g[data-node]').attr('opacity',1);
     blockEdges.selectAll('path').attr('stroke-opacity',function(){
       return this.getAttribute('data-bb')==='1'?BB_OP:SEC_OP;
     });
-    relEdges.selectAll('path').attr('stroke-opacity',0.4);
   }
 
   // Readiness (orthogonal to status): is each issue blocked, unblocked, or only
@@ -1024,6 +1004,9 @@ function render(nodes, links, filterText='') {
       none:     {w:1,   o:0.8,  d:null },
       ext:      {w:0.5, o:0.4,  d:null },
     }[rd];
+    // Solid base (opaque) so edges routed behind a card don't show through,
+    // then the status tint + readiness border on top.
+    g.append('rect').attr('width',NW).attr('height',NH).attr('rx',7).attr('fill','var(--bg2)');
     g.append('rect').attr('width',NW).attr('height',NH).attr('rx',7)
       .attr('fill',col).attr('fill-opacity',ext?0.07:0.10)
       .attr('stroke',col).attr('stroke-width',bs.w).attr('stroke-opacity',bs.o)
