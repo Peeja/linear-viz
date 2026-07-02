@@ -79,11 +79,11 @@ button:disabled { opacity:0.4; cursor:default; transform:none; }
 <div class="sb" id="sb">
   <span id="st">Enter a parent issue ID (e.g. FIL-273) and click Load.</span>
   <div class="legend" id="legend" style="display:none">
-    <div class="li"><div class="dot" style="background:var(--c-done)"></div>Done</div>
-    <div class="li"><div class="dot" style="background:var(--c-progress)"></div>In progress</div>
-    <div class="li"><div class="dot" style="background:var(--c-review)"></div>In review</div>
-    <div class="li"><div class="dot" style="background:var(--c-todo)"></div>Todo/backlog</div>
-    <div class="li"><div class="dot" style="background:var(--c-cancelled)"></div>Cancelled</div>
+    <div class="li" data-status="done"><div class="dot" style="background:var(--c-done)"></div>Done</div>
+    <div class="li" data-status="progress"><div class="dot" style="background:var(--c-progress)"></div>In progress</div>
+    <div class="li" data-status="review"><div class="dot" style="background:var(--c-review)"></div>In review</div>
+    <div class="li" data-status="todo"><div class="dot" style="background:var(--c-todo)"></div>Todo/backlog</div>
+    <div class="li" data-status="cancelled"><div class="dot" style="background:var(--c-cancelled)"></div>Cancelled</div>
     <div class="li" style="margin-left:4px"><svg width="17" height="11"><rect x="1" y="1" width="15" height="9" rx="2" fill="none" stroke="var(--text2)" stroke-width="2"/></svg>Unblocked</div>
     <div class="li"><svg width="17" height="11"><rect x="1" y="1" width="15" height="9" rx="2" fill="none" stroke="var(--text2)" stroke-width="1.3" stroke-dasharray="3 2"/></svg>Review-blocked</div>
     <div class="li"><svg width="17" height="11"><rect x="1" y="1" width="15" height="9" rx="2" fill="none" stroke="var(--text2)" stroke-opacity="0.35"/></svg>Blocked</div>
@@ -105,6 +105,7 @@ let allNodes=[], allLinks=[], svgSel, gSel;
 let WORKSPACE = 'filecoin-foundation';  // overwritten from /api/meta
 let START_REPOS = [];   // owner/repo slugs to attach to a start session (incl. skill repo)
 let START_ENV = '';     // optional cloud environment name/id
+let fadeByStatus=null, clearFade=null;   // set by render(); used by legend hover
 // Deep-link that opens a Claude Code web session prefilled to start this issue.
 // Encode with encodeURIComponent (spaces → %20, per the docs' examples) rather
 // than URLSearchParams (which uses +) so the prompt arrives intact.
@@ -159,6 +160,15 @@ const isDummy = id => typeof id === 'string' && id.startsWith('__d_');
 function isReview(type, name){ return (type||'').toLowerCase()==='started' && !!name && /review/i.test(name); }
 function isDone(type){ return (type||'').toLowerCase()==='completed'; }
 function isCancelled(type){ const s=(type||'').toLowerCase(); return s==='canceled'||s==='cancelled'; }
+// Normalised status key matching the legend's data-status values.
+function statusKey(n){
+  if (isReview(n.stateType, n.stateName)) return 'review';
+  const t=(n.stateType||'').toLowerCase();
+  if (t==='completed') return 'done';
+  if (t==='started')   return 'progress';
+  if (isCancelled(t))  return 'cancelled';
+  return 'todo';
+}
 
 function stateColor(t, name) {
   if (isReview(t, name)) return '#8E76E5';
@@ -967,6 +977,15 @@ function render(nodes, links, filterText='', preserveScroll=false) {
       return this.getAttribute('data-bb')==='1'?BB_OP:SEC_OP;
     });
   }
+  // Expose status fading to the (static) legend hover handlers: fade issues whose
+  // status doesn't match, same treatment as the node-hover chain fade.
+  fadeByStatus=(key)=>{
+    nodeG.selectAll('g[data-node]').attr('opacity',function(){
+      return this.getAttribute('data-status')===key?1:0.12;
+    });
+    blockEdges.selectAll('path').attr('stroke-opacity',0.06);
+  };
+  clearFade=clearHighlight;
 
   // Readiness (orthogonal to status): is each issue blocked, unblocked, or only
   // blocked by In-Review work (startable as a stacked PR)? Computed over the FULL
@@ -990,7 +1009,7 @@ function render(nodes, links, filterText='', preserveScroll=false) {
     const col=stateColor(n.stateType, n.stateName), ext=n.external;
     const rd = ext ? 'ext' : readinessOf(n);
     // Hover highlights the dependency chain (the popover was dropped as redundant).
-    const g=nodeG.append('g').attr('data-node',n.id).attr('transform',`translate(${p.x},${p.y})`).style('cursor','pointer')
+    const g=nodeG.append('g').attr('data-node',n.id).attr('data-status',statusKey(n)).attr('transform',`translate(${p.x},${p.y})`).style('cursor','pointer')
       .on('mouseover', ()=>highlight(n.id))
       .on('mouseout', clearHighlight)
       .on('click',()=>window.open(`https://linear.app/${WORKSPACE}/issue/${n.identifier}`,'_blank'));
@@ -1125,6 +1144,12 @@ document.getElementById('lb').addEventListener('click', async ()=>{
 });
 document.getElementById('fi').addEventListener('input', e=>{ if(allNodes.length) render(allNodes,allLinks,e.target.value); });
 document.getElementById('zf').addEventListener('click', scrollToTop);
+// Hovering a status in the legend fades issues that don't match (like node hover).
+document.querySelectorAll('#legend .li[data-status]').forEach(li=>{
+  li.style.cursor='pointer';
+  li.addEventListener('mouseenter', ()=>fadeByStatus && fadeByStatus(li.getAttribute('data-status')));
+  li.addEventListener('mouseleave', ()=>clearFade && clearFade());
+});
 document.getElementById('pi').addEventListener('keydown',e=>{
   if(e.key==='Enter') document.getElementById('lb').click();
 });
