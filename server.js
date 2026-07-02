@@ -159,6 +159,7 @@ const server = http.createServer(async (req, res) => {
       workspace: cfg.workspace || 'filecoin-foundation',
       startRepos,
       startEnvironment: cfg.startEnvironment || '',
+      pollMs: cfg.pollMs ?? 20000,   // live-refresh cadence (0 = off)
     }));
     return;
   }

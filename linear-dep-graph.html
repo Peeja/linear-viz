@@ -222,10 +222,13 @@ function prStateFromMeta(md){
   const s=(md.status||md.state||'').toString().toLowerCase();
   return (s==='merged'||s==='closed'||s==='draft'||s==='open') ? s : null;
 }
+let _prMetaLogged=false;
 function prOf(attachments){
   const ns=(attachments?.nodes||[]).filter(a=>a.url && GH_PR.test(a.url));
   if(!ns.length) return null;
   ns.sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));
+  // TEMP: log one PR attachment's metadata so we can confirm Linear's state field. Remove once wired.
+  if(!_prMetaLogged){ _prMetaLogged=true; try{ console.debug('[linear-viz] PR attachment metadata (for wiring PR state):', ns[0].url, ns[0].metadata); }catch{} }
   return { url:ns[0].url, state:prStateFromMeta(ns[0].metadata) };
 }
 function buildGraph(issues) {
@@ -857,7 +860,7 @@ function personColor(name){
 }
 
 // ── Render ───────────────────────────────────────────────────────────────────
-function render(nodes, links, filterText='') {
+function render(nodes, links, filterText='', preserveScroll=false) {
   const wrap=document.getElementById('gw');
   const svgEl=document.getElementById('svg');
   const emptyEl=document.getElementById('es');
@@ -1063,9 +1066,10 @@ function render(nodes, links, filterText='') {
         `Start a Claude Code session — /start-issue ${n.identifier}`, ()=>window.open(startUrl(n.identifier),'_blank'));
   });
 
-  // Graph is sized to fit width and centred (gSel transform set above); the
-  // page scrolls vertically. Reset scroll to the top on each render.
-  wrap.scrollTop=0;
+  // Graph is sized to fit width and centred (gSel transform set above); the page
+  // scrolls vertically. Reset scroll to the top on a fresh load, but keep the
+  // viewport put on a live-refresh re-render.
+  if(!preserveScroll) wrap.scrollTop=0;
 }
 
 // Scroll the view to the top (where Done / earliest work sits).
@@ -1075,6 +1079,35 @@ function scrollToTop() {
 }
 
 // ── Controls ─────────────────────────────────────────────────────────────────
+// Live polling: after a load, re-fetch on an interval and re-render only when the
+// data actually changed, keeping the viewport put. Position is relationship-driven,
+// so status/PR/session changes update in place instead of reshuffling the graph.
+let currentPid=null, lastKey=null, pollTimer=null, polling=false, POLL_MS=20000;
+async function loadInto(pid, {manual=false}={}){
+  const issues=await loadIssues(pid);
+  const key=JSON.stringify(issues);
+  if(!manual && key===lastKey) return false;   // poll with no change → skip re-render
+  lastKey=key;
+  const {nodes,links}=buildGraph(issues);
+  allNodes=nodes; allLinks=links;
+  document.getElementById('legend').style.display='flex';
+  const nb=links.filter(l=>l.type==='blocks').length;
+  setStatus(`${issues.length} issues · ${nb} blocking relation${nb!==1?'s':''} · click to open in Linear`);
+  render(allNodes,allLinks,document.getElementById('fi').value, !manual);   // keep scroll on poll
+  return true;
+}
+function startPolling(){
+  if(pollTimer) clearInterval(pollTimer);
+  if(POLL_MS>0 && currentPid) pollTimer=setInterval(pollTick, POLL_MS);
+}
+async function pollTick(){
+  if(polling || !currentPid || document.hidden) return;   // skip if busy or tab hidden
+  polling=true;
+  try { await loadInto(currentPid); } catch(e){ /* keep last good view */ }
+  finally { polling=false; }
+}
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) pollTick(); });  // refresh on return
+
 document.getElementById('lb').addEventListener('click', async ()=>{
   const pid=document.getElementById('pi').value.trim().toUpperCase();
   if (!pid)  { setStatus('Enter a parent issue identifier.',true); return; }
@@ -1082,16 +1115,12 @@ document.getElementById('lb').addEventListener('click', async ()=>{
   btn.disabled=true; btn.textContent='Loading…';
   setStatus('Fetching from Linear…');
   try {
-    const issues=await loadIssues(pid);
-    const {nodes,links}=buildGraph(issues);
-    allNodes=nodes; allLinks=links;
-    document.getElementById('legend').style.display='flex';
-    const nb=links.filter(l=>l.type==='blocks').length;
-    setStatus(`${issues.length} issues · ${nb} blocking relation${nb!==1?'s':''} · click to open in Linear`);
-    render(allNodes,allLinks,document.getElementById('fi').value);
-    // Reflect the loaded root in the URL so a refresh keeps it (no history spam).
+    lastKey=null;                       // force a render on an explicit (re)load
+    await loadInto(pid, {manual:true});
+    currentPid=pid;
     const url=new URL(location.href); url.searchParams.set('issue',pid);
     history.replaceState(null,'',url);
+    startPolling();
   } catch(e) { setStatus('Error: '+e.message,true); console.error(e); }
   finally { btn.disabled=false; btn.textContent='Reload'; }
 });
@@ -1111,6 +1140,7 @@ fetch('/api/meta').then(r=>r.json()).then(m=>{
   if(m.workspace) WORKSPACE=m.workspace;
   if(Array.isArray(m.startRepos)) START_REPOS=m.startRepos;
   if(m.startEnvironment) START_ENV=m.startEnvironment;
+  if(typeof m.pollMs==='number'){ POLL_MS=m.pollMs; startPolling(); }   // apply configured cadence
 }).catch(()=>{});
 
 // Restore the root issue from the URL (?issue=FIL-273) so a refresh keeps it.

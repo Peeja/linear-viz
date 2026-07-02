@@ -17,5 +17,9 @@
   "skillRepo": "Peeja/ff-claude",
 
   // Optional: pin a Claude Code cloud environment (name or id). Empty = pick in the UI.
-  "startEnvironment": ""
+  "startEnvironment": "",
+
+  // Live-refresh cadence in milliseconds: the page re-polls Linear this often and
+  // re-renders only when something changed. 0 turns auto-refresh off.
+  "pollMs": 20000
 }
