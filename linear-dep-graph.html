@@ -960,22 +960,23 @@ function render(nodes, links, filterText='', preserveScroll=false) {
     }
     return seen;
   }
+  // Dim edges via element `opacity` (not stroke-opacity) so the arrowhead marker
+  // dims with the body — a path's stroke-opacity doesn't propagate to its marker.
+  // The base backbone/secondary strength stays in each path's stroke-opacity.
   function highlight(nodeId){
     // chain = node + everything upstream + everything downstream
     const set=new Set([...reach(nodeId,fwd),...reach(nodeId,rev)]);
     nodeG.selectAll('g[data-node]').attr('opacity',function(){
       return set.has(this.getAttribute('data-node'))?1:0.12;
     });
-    blockEdges.selectAll('path').attr('stroke-opacity',function(){
+    blockEdges.selectAll('path').attr('opacity',function(){
       const s=this.getAttribute('data-src'), t=this.getAttribute('data-tgt');
-      return set.has(s)&&set.has(t)?0.95:0.06;
+      return set.has(s)&&set.has(t)?1:0.06;
     });
   }
   function clearHighlight(){
     nodeG.selectAll('g[data-node]').attr('opacity',1);
-    blockEdges.selectAll('path').attr('stroke-opacity',function(){
-      return this.getAttribute('data-bb')==='1'?BB_OP:SEC_OP;
-    });
+    blockEdges.selectAll('path').attr('opacity',1);
   }
   // Expose status fading to the (static) legend hover handlers: fade issues whose
   // status doesn't match, same treatment as the node-hover chain fade.
@@ -983,7 +984,7 @@ function render(nodes, links, filterText='', preserveScroll=false) {
     nodeG.selectAll('g[data-node]').attr('opacity',function(){
       return this.getAttribute('data-status')===key?1:0.12;
     });
-    blockEdges.selectAll('path').attr('stroke-opacity',0.06);
+    blockEdges.selectAll('path').attr('opacity',0.06);
   };
   clearFade=clearHighlight;
 
