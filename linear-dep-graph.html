@@ -213,22 +213,21 @@ function sessionUrlOf(attachments) {
 // GitHub PR linked to the issue (Linear creates an attachment for it). Identify
 // it by URL (robust); read its state from the attachment metadata.
 const GH_PR = /^https?:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/i;
+// Linear's GitHub PR attachment metadata carries mergedAt/closedAt timestamps,
+// a `draft` flag, and a `status` string. Derive the state from the authoritative
+// timestamps first, then draft, else it's an open PR.
 function prStateFromMeta(md){
-  // NOTE: exact metadata field is being confirmed against a real PR (FIL-569).
-  // Map conservatively; return null (→ no icon) for anything unrecognised so we
-  // never show a wrong state.
   if(!md || typeof md!=='object') return null;
-  if(md.draft===true || md.isDraft===true) return 'draft';
-  const s=(md.status||md.state||'').toString().toLowerCase();
-  return (s==='merged'||s==='closed'||s==='draft'||s==='open') ? s : null;
+  const s=(md.status||'').toLowerCase();
+  if(md.mergedAt || s==='merged') return 'merged';   // a merge sets BOTH mergedAt and closedAt — check first
+  if(md.closedAt || s==='closed') return 'closed';   // closed without merging
+  if(md.draft===true || s==='draft') return 'draft';
+  return 'open';
 }
-let _prMetaLogged=false;
 function prOf(attachments){
   const ns=(attachments?.nodes||[]).filter(a=>a.url && GH_PR.test(a.url));
   if(!ns.length) return null;
   ns.sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));
-  // TEMP: log one PR attachment's metadata so we can confirm Linear's state field. Remove once wired.
-  if(!_prMetaLogged){ _prMetaLogged=true; try{ console.debug('[linear-viz] PR attachment metadata (for wiring PR state):', ns[0].url, ns[0].metadata); }catch{} }
   return { url:ns[0].url, state:prStateFromMeta(ns[0].metadata) };
 }
 function buildGraph(issues) {
