@@ -6,6 +6,10 @@
   // Workspace slug, used for click-to-open Linear links.
   "workspace": "filecoin-foundation",
 
+  // Team key whose cycles fill the dropdown — the prefix on your issue IDs
+  // (e.g. "FIL" for FIL-273). Leave empty to list cycles from every team.
+  "team": "FIL",
+
   // Port for the local server.
   "port": 8787,
 

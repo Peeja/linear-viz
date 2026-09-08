@@ -33,7 +33,13 @@ input[type="password"],input[type="text"] {
 input[type="password"] { font-family:var(--mono); flex:1; }
 input.ii { width:148px; }
 input.fi { flex:1; }
-input:focus { box-shadow:0 0 0 2px rgba(55,138,221,0.2); }
+input:focus, select:focus { box-shadow:0 0 0 2px rgba(55,138,221,0.2); }
+select.cs {
+  height:30px; padding:0 8px; border:0.5px solid var(--border2);
+  border-radius:var(--radius); background:var(--bg2); color:var(--text);
+  font-family:var(--font); font-size:12px; outline:none; cursor:pointer;
+  min-width:230px; max-width:320px;
+}
 button {
   height:30px; padding:0 12px; font-size:12px; font-weight:500;
   font-family:var(--font); background:var(--bg2); border:0.5px solid var(--border2);
@@ -68,16 +74,16 @@ button:disabled { opacity:0.4; cursor:default; transform:none; }
   <h1>Linear · dependency graph</h1>
   <div class="controls">
     <div class="row">
-      <input type="text" id="pi" class="ii" placeholder="Parent ID  e.g. FIL-273" spellcheck="false"/>
-      <button id="lb">Load</button>
+      <select id="cs" class="cs"><option value="">Loading cycles…</option></select>
+      <button id="lb">Reload</button>
       <input type="text" id="fi" class="fi" placeholder="Filter by identifier or title…"/>
       <button id="zf">Top</button>
     </div>
-    <div class="kh">API key loaded server-side from config.json — never sent to the browser.</div>
+    <div class="kh">API key loaded server-side from config.jsonc — never sent to the browser.</div>
   </div>
 </header>
 <div class="sb" id="sb">
-  <span id="st">Enter a parent issue ID (e.g. FIL-273) and click Load.</span>
+  <span id="st">Loading cycles…</span>
   <div class="legend" id="legend" style="display:none">
     <div class="li" data-status="done"><div class="dot" style="background:var(--c-done)"></div>Done</div>
     <div class="li" data-status="progress"><div class="dot" style="background:var(--c-progress)"></div>In progress</div>
@@ -105,6 +111,7 @@ let allNodes=[], allLinks=[], svgSel, gSel;
 let WORKSPACE = 'filecoin-foundation';  // overwritten from /api/meta
 let START_REPOS = [];   // owner/repo slugs to attach to a start session (incl. skill repo)
 let START_ENV = '';     // optional cloud environment name/id
+let TEAM = '';          // team key (e.g. "FIL") whose cycles fill the dropdown
 let fadeByStatus=null, clearFade=null;   // set by render(); used by legend hover
 // Deep-link that opens a Claude Code web session prefilled to start this issue.
 // Encode with encodeURIComponent (spaces → %20, per the docs' examples) rather
@@ -199,14 +206,31 @@ const USER = `assignee{name displayName avatarUrl}`;
 const ATTACH = `attachments(first:25){nodes{url createdAt metadata}}`;
 const FRAG = `id identifier title state{type name} ${USER} ${ATTACH}
   relations(first:50){nodes{type relatedIssue{id identifier title state{type name} ${USER}}}}`;
-async function loadIssues(pid) {
-  // issue(id:) accepts both the human identifier (e.g. "FIL-273") and the UUID
-  const pd = await gqlQ(`query($id:String!){issue(id:$id){${FRAG} children(first:250){nodes{${FRAG}}}}}`,{id:pid});
-  const par = pd.issue;
-  if (!par) throw new Error(`Issue "${pid}" not found.`);
-  // children(first:) is available directly on the parent — use it instead of a filter query
-  const ch = par.children?.nodes || [];
-  return [par, ...ch.filter(c=>c.id!==par.id)];
+// Cycles for the configured team (or the whole workspace if `team` is unset).
+async function loadCycles() {
+  const d = TEAM
+    ? await gqlQ(`query($k:String!){cycles(filter:{team:{key:{eq:$k}}},first:100){nodes{id number name startsAt endsAt}}}`,{k:TEAM})
+    : await gqlQ(`{cycles(first:100){nodes{id number name startsAt endsAt}}}`);
+  return d.cycles?.nodes || [];
+}
+// Every issue in a cycle. Blocking relations to issues outside the cycle still
+// come through the fragment and render as external nodes.
+async function loadCycleIssues(cycleId) {
+  const d = await gqlQ(`query($id:String!){cycle(id:$id){issues(first:250){nodes{${FRAG}}}}}`,{id:cycleId});
+  const nodes = d.cycle?.issues?.nodes;
+  if (!nodes) throw new Error('Cycle not found.');
+  return nodes;
+}
+// "Cycle 5 (Sep 7–Sep 21)" — Linear leaves `name` null unless it was customised.
+function cycleLabel(c){
+  const d = s => s ? new Date(s).toLocaleDateString(undefined,{month:'short',day:'numeric'}) : '';
+  const range = (c.startsAt && c.endsAt) ? ` (${d(c.startsAt)}–${d(c.endsAt)})` : '';
+  return (c.name || `Cycle ${c.number}`) + range;
+}
+function isCurrentCycle(c){
+  if(!c.startsAt || !c.endsAt) return false;
+  const now=Date.now();
+  return Date.parse(c.startsAt) <= now && now < Date.parse(c.endsAt);
 }
 
 // ── Graph build ──────────────────────────────────────────────────────────────
@@ -1101,9 +1125,9 @@ function scrollToTop() {
 // Live polling: after a load, re-fetch on an interval and re-render only when the
 // data actually changed, keeping the viewport put. Position is relationship-driven,
 // so status/PR/session changes update in place instead of reshuffling the graph.
-let currentPid=null, lastKey=null, pollTimer=null, polling=false, POLL_MS=20000;
-async function loadInto(pid, {manual=false}={}){
-  const issues=await loadIssues(pid);
+let currentCycleId=null, lastKey=null, pollTimer=null, polling=false, POLL_MS=20000;
+async function loadInto(cycleId, {manual=false}={}){
+  const issues=await loadCycleIssues(cycleId);
   const key=JSON.stringify(issues);
   if(!manual && key===lastKey) return false;   // poll with no change → skip re-render
   lastKey=key;
@@ -1117,32 +1141,61 @@ async function loadInto(pid, {manual=false}={}){
 }
 function startPolling(){
   if(pollTimer) clearInterval(pollTimer);
-  if(POLL_MS>0 && currentPid) pollTimer=setInterval(pollTick, POLL_MS);
+  if(POLL_MS>0 && currentCycleId) pollTimer=setInterval(pollTick, POLL_MS);
 }
 async function pollTick(){
-  if(polling || !currentPid || document.hidden) return;   // skip if busy or tab hidden
+  if(polling || !currentCycleId || document.hidden) return;   // skip if busy or tab hidden
   polling=true;
-  try { await loadInto(currentPid); } catch(e){ /* keep last good view */ }
+  try { await loadInto(currentCycleId); } catch(e){ /* keep last good view */ }
   finally { polling=false; }
 }
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) pollTick(); });  // refresh on return
 
-document.getElementById('lb').addEventListener('click', async ()=>{
-  const pid=document.getElementById('pi').value.trim().toUpperCase();
-  if (!pid)  { setStatus('Enter a parent issue identifier.',true); return; }
+// Load one cycle into the graph and reflect it in the URL.
+async function selectCycle(cycleId){
+  if(!cycleId) return;
   const btn=document.getElementById('lb');
   btn.disabled=true; btn.textContent='Loading…';
   setStatus('Fetching from Linear…');
   try {
     lastKey=null;                       // force a render on an explicit (re)load
-    await loadInto(pid, {manual:true});
-    currentPid=pid;
-    const url=new URL(location.href); url.searchParams.set('issue',pid);
+    await loadInto(cycleId, {manual:true});
+    currentCycleId=cycleId;
+    const url=new URL(location.href);
+    url.searchParams.set('cycle',cycleId); url.searchParams.delete('issue');
     history.replaceState(null,'',url);
     startPolling();
   } catch(e) { setStatus('Error: '+e.message,true); console.error(e); }
   finally { btn.disabled=false; btn.textContent='Reload'; }
-});
+}
+// Fill the dropdown, then open ?cycle= if present, else the current cycle.
+async function initCycles(){
+  const sel=document.getElementById('cs');
+  setStatus('Loading cycles…');
+  let cycles;
+  try { cycles=await loadCycles(); }
+  catch(e){ setStatus('Error loading cycles: '+e.message,true); console.error(e); return; }
+  if(!cycles.length){
+    sel.innerHTML='<option value="">No cycles</option>';
+    setStatus(`No cycles found${TEAM?` for team ${TEAM}`:''}.`,true);
+    return;
+  }
+  cycles.sort((a,b)=>(b.startsAt||'').localeCompare(a.startsAt||''));   // newest first
+  sel.innerHTML='';
+  cycles.forEach(c=>{
+    const o=document.createElement('option');
+    o.value=c.id;
+    o.textContent=cycleLabel(c)+(isCurrentCycle(c)?' · current':'');
+    sel.appendChild(o);
+  });
+  const wanted=new URLSearchParams(location.search).get('cycle');
+  const pick=cycles.find(c=>c.id===wanted) || cycles.find(isCurrentCycle) || cycles[0];
+  sel.value=pick.id;
+  await selectCycle(pick.id);
+}
+
+document.getElementById('cs').addEventListener('change', e=>selectCycle(e.target.value));
+document.getElementById('lb').addEventListener('click', ()=>selectCycle(document.getElementById('cs').value));
 document.getElementById('fi').addEventListener('input', e=>{ if(allNodes.length) render(allNodes,allLinks,e.target.value); });
 document.getElementById('zf').addEventListener('click', scrollToTop);
 // Hovering a status in the legend fades issues that don't match (like node hover).
@@ -1151,29 +1204,25 @@ document.querySelectorAll('#legend .li[data-status]').forEach(li=>{
   li.addEventListener('mouseenter', ()=>fadeByStatus && fadeByStatus(li.getAttribute('data-status')));
   li.addEventListener('mouseleave', ()=>clearFade && clearFade());
 });
-document.getElementById('pi').addEventListener('keydown',e=>{
-  if(e.key==='Enter') document.getElementById('lb').click();
-});
 window.addEventListener('resize', ()=>{ if(allNodes.length) render(allNodes,allLinks,document.getElementById('fi').value); });
 
 // Dev live-reload: refresh the page when the served HTML changes on disk
 // (e.g. a git pull lands). Harmless if the endpoint isn't available.
 try { new EventSource('/api/reload').onmessage = ()=>location.reload(); } catch {}
 
-// Pick up the workspace slug (for click-to-open links) from the server config.
-fetch('/api/meta').then(r=>r.json()).then(m=>{
-  if(m.workspace) WORKSPACE=m.workspace;
-  if(Array.isArray(m.startRepos)) START_REPOS=m.startRepos;
-  if(m.startEnvironment) START_ENV=m.startEnvironment;
-  if(typeof m.pollMs==='number'){ POLL_MS=m.pollMs; startPolling(); }   // apply configured cadence
-}).catch(()=>{});
-
-// Restore the root issue from the URL (?issue=FIL-273) so a refresh keeps it.
-const initialIssue=new URLSearchParams(location.search).get('issue');
-if(initialIssue){
-  document.getElementById('pi').value=initialIssue;
-  document.getElementById('lb').click();
-}
+// Boot: read the server config (workspace, team, poll cadence) first — the cycles
+// query needs TEAM — then fill the dropdown and open a cycle.
+(async ()=>{
+  try {
+    const m = await (await fetch('/api/meta')).json();
+    if(m.workspace) WORKSPACE=m.workspace;
+    if(Array.isArray(m.startRepos)) START_REPOS=m.startRepos;
+    if(m.startEnvironment) START_ENV=m.startEnvironment;
+    if(m.team) TEAM=m.team;
+    if(typeof m.pollMs==='number') POLL_MS=m.pollMs;
+  } catch(e) { /* fall back to defaults */ }
+  await initCycles();
+})();
 </script>
 </body>
 </html>

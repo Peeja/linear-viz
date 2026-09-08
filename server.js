@@ -157,6 +157,7 @@ const server = http.createServer(async (req, res) => {
     if (!startRepos.includes(skillRepo)) startRepos.push(skillRepo);
     send(res, 200, 'application/json', JSON.stringify({
       workspace: cfg.workspace || 'filecoin-foundation',
+      team: cfg.team || '',          // team key whose cycles fill the dropdown
       startRepos,
       startEnvironment: cfg.startEnvironment || '',
       pollMs: cfg.pollMs ?? 20000,   // live-refresh cadence (0 = off)
