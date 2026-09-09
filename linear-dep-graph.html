@@ -203,9 +203,11 @@ async function gqlQ(query, vars={}) {
   return j.data;
 }
 const USER = `assignee{name displayName avatarUrl}`;
-const ATTACH = `attachments(first:25){nodes{url createdAt metadata}}`;
+// Linear bills query "complexity" as roughly the product of the nested page
+// sizes, against a 10k cap — so these stay modest and the issue list is paged.
+const ATTACH = `attachments(first:15){nodes{url createdAt metadata}}`;
 const FRAG = `id identifier title state{type name} ${USER} ${ATTACH}
-  relations(first:50){nodes{type relatedIssue{id identifier title state{type name} ${USER}}}}`;
+  relations(first:20){nodes{type relatedIssue{id identifier title state{type name} ${USER}}}}`;
 // Cycles for the configured team (or the whole workspace if `team` is unset).
 async function loadCycles() {
   const d = TEAM
@@ -213,13 +215,34 @@ async function loadCycles() {
     : await gqlQ(`{cycles(first:100){nodes{id number name startsAt endsAt}}}`);
   return d.cycles?.nodes || [];
 }
-// Every issue in a cycle. Blocking relations to issues outside the cycle still
-// come through the fragment and render as external nodes.
+// Every issue in a cycle, fetched a page at a time — a whole cycle in one query
+// blows Linear's complexity cap. Shrinks the page size and retries if a cycle
+// still comes back too complex, so this adapts rather than failing outright.
+// Blocking relations to issues outside the cycle come through the fragment and
+// render as external nodes.
+let ISSUE_PAGE = 40;
 async function loadCycleIssues(cycleId) {
-  const d = await gqlQ(`query($id:String!){cycle(id:$id){issues(first:250){nodes{${FRAG}}}}}`,{id:cycleId});
-  const nodes = d.cycle?.issues?.nodes;
-  if (!nodes) throw new Error('Cycle not found.');
-  return nodes;
+  const out=[]; let after=null;
+  for (let guard=0; guard<50; guard++) {
+    let conn;
+    for (;;) {
+      try {
+        const d = await gqlQ(
+          `query($id:String!,$after:String){cycle(id:$id){issues(first:${ISSUE_PAGE},after:$after){pageInfo{hasNextPage endCursor} nodes{${FRAG}}}}}`,
+          {id:cycleId, after});
+        conn = d.cycle?.issues;
+        break;
+      } catch(e) {
+        if (/too complex/i.test(e.message) && ISSUE_PAGE > 5) { ISSUE_PAGE = Math.max(5, Math.floor(ISSUE_PAGE/2)); continue; }
+        throw e;
+      }
+    }
+    if (!conn) throw new Error('Cycle not found.');
+    out.push(...(conn.nodes||[]));
+    if (!conn.pageInfo?.hasNextPage) break;
+    after = conn.pageInfo.endCursor;
+  }
+  return out;
 }
 // "Cycle 5 (Sep 7–Sep 21)" — Linear leaves `name` null unless it was customised.
 function cycleLabel(c){
